@@ -1,0 +1,13 @@
+node_modules
+build/
+.dart_tool/
+.flutter-plugins-dependencies
+.metadata
+*.log
+logcat.txt
+logcat_dump.txt
+shell_logcat.txt
+flutter.log
+temp_old.dart
+lib/core/secrets.dart
+lib/firebase_options.dart

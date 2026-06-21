@@ -1,7 +1,7 @@
 name: wifi
 description: "WiFi — Persistent Private Audio Room"
 publish_to: 'none'
-version: 1.0.8+9
+version: 3.0.0.4+35
 
 environment:
   sdk: ^3.12.2
@@ -24,6 +24,9 @@ dependencies:
   # Background Service
   flutter_foreground_task: ^8.17.0
 
+  # Location
+  geolocator: ^11.0.0
+
   # UI
   google_fonts: ^6.2.1
   cupertino_icons: ^1.0.8
@@ -45,6 +48,11 @@ dependencies:
   path_provider: ^2.1.6
   open_filex: ^4.7.0
   firebase_analytics: ^11.6.0
+  firebase_messaging: ^15.2.4
+  flutter_local_notifications: ^18.0.1
+  intl: ^0.20.2
+  googleapis_auth: ^1.6.0
+  http: ^1.2.0
 
 dev_dependencies:
   flutter_test:
