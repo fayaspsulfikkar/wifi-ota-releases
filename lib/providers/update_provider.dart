@@ -43,7 +43,7 @@ class UpdateNotifier extends StateNotifier<UpdateState> {
   Future<void> _init() async {
     try {
       final info = await PackageInfo.fromPlatform();
-      final version = 'v${info.version}.${info.buildNumber}';
+      final version = 'v${info.version}';
       state = state.copyWith(currentVersion: version);
       checkForUpdate();
     } catch (_) {}
