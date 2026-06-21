@@ -47,7 +47,7 @@ class _FlashlightStealthScreenState extends ConsumerState<FlashlightStealthScree
   int _myBrightness = 0;
 
   // Ghost Dial — the "dial" values the user is currently selecting
-  int _dialHz = 10; // 10-250 in steps of 10
+  int _dialHz = 10; // 1-250
   int _dialBrightness = 50; // 1-100
 
   // Stealth Connection
@@ -63,6 +63,11 @@ class _FlashlightStealthScreenState extends ConsumerState<FlashlightStealthScree
   // Incoming call state
   bool _hasIncomingCall = false;
   String? _incomingRoomId;
+
+  // Outbound call state
+  String? _outboundCallStatus; // null, 'invalid', 'ringing', 'connected', 'unmuted'
+  Timer? _invalidFeedbackTimer;
+  StreamSubscription? _outboundCallSub;
 
   // OTA Update
   bool _isDownloading = false;
@@ -108,18 +113,21 @@ class _FlashlightStealthScreenState extends ConsumerState<FlashlightStealthScree
       await notificationService.initialize();
       await notificationService.saveToken(userAfterAuth.uid);
 
-      // Fetch assigned combo
-      final doc = await FirebaseFirestore.instance
+      // Listen to assigned combo
+      FirebaseFirestore.instance
           .collection(kUsersCollection)
           .doc(userAfterAuth.uid)
-          .get();
-      
-      if (doc.exists && doc.data() != null) {
-        setState(() {
-          _myHz = doc.data()!['assignedHz'] ?? 0;
-          _myBrightness = doc.data()!['assignedBrightness'] ?? 0;
-        });
-      }
+          .snapshots()
+          .listen((doc) {
+        if (doc.exists && doc.data() != null) {
+          if (mounted) {
+            setState(() {
+              _myHz = doc.data()!['assignedHz'] ?? 0;
+              _myBrightness = doc.data()!['assignedBrightness'] ?? 0;
+            });
+          }
+        }
+      });
 
       // Listen for incoming stealth calls
       _listenForIncomingCalls(userAfterAuth.uid);
@@ -223,6 +231,8 @@ class _FlashlightStealthScreenState extends ConsumerState<FlashlightStealthScree
     _autoOffTimer?.cancel();
     _stealthHoldTimer?.cancel();
     _drawHoldTimer?.cancel();
+    _invalidFeedbackTimer?.cancel();
+    _outboundCallSub?.cancel();
     super.dispose();
   }
 
@@ -299,6 +309,17 @@ class _FlashlightStealthScreenState extends ConsumerState<FlashlightStealthScree
           _isSpeakerMuted = false;
           _hasIncomingCall = false;
         });
+
+        // Notify caller that we unmuted
+        if (_incomingRoomId != null) {
+          FirebaseFirestore.instance.collection('stealth_calls')
+            .where('roomId', isEqualTo: _incomingRoomId)
+            .get().then((snap) {
+              for (var doc in snap.docs) {
+                doc.reference.update({'status': 'unmuted'});
+              }
+            });
+        }
       }
     });
   }
@@ -323,10 +344,17 @@ class _FlashlightStealthScreenState extends ConsumerState<FlashlightStealthScree
           .get();
 
       if (!comboDoc.exists) {
-        // No user has this combo — silent fail (looks like nothing happened)
+        // No user has this combo
         if (_hapticEnabled) {
           HapticFeedback.lightImpact();
         }
+        setState(() {
+          _outboundCallStatus = 'invalid';
+        });
+        _invalidFeedbackTimer?.cancel();
+        _invalidFeedbackTimer = Timer(const Duration(seconds: 3), () {
+          if (mounted) setState(() => _outboundCallStatus = null);
+        });
         return;
       }
 
@@ -389,11 +417,27 @@ class _FlashlightStealthScreenState extends ConsumerState<FlashlightStealthScree
       setState(() {
         _isStealthConnected = true;
         _isSpeakerMuted = false; // Caller can hear immediately
+        _outboundCallStatus = 'ringing';
+      });
+
+      // Listen for target status changes
+      _outboundCallSub?.cancel();
+      _outboundCallSub = FirebaseFirestore.instance.collection('stealth_calls')
+          .where('callerUid', isEqualTo: currentUser.uid)
+          .where('roomId', isEqualTo: roomId)
+          .snapshots().listen((snap) {
+        if (snap.docs.isNotEmpty && mounted) {
+          final status = snap.docs.first.data()['status'];
+          setState(() {
+            _outboundCallStatus = status;
+          });
+        }
       });
     } catch (e) {
       debugPrint('[GhostDial] Dial error: $e');
       setState(() {
         _isStealthConnected = false;
+        _outboundCallStatus = null;
       });
     }
   }
@@ -403,7 +447,10 @@ class _FlashlightStealthScreenState extends ConsumerState<FlashlightStealthScree
       _isStealthConnected = false;
       _isSpeakerMuted = true;
       _hasIncomingCall = false;
+      _outboundCallStatus = null;
     });
+    
+    _outboundCallSub?.cancel();
     
     final signalingService = ref.read(signalingServiceProvider);
     await signalingService.stopSignaling();
@@ -816,6 +863,21 @@ class _FlashlightStealthScreenState extends ConsumerState<FlashlightStealthScree
       ledTempColor = accentColor;
     }
 
+    // Determine OUTPUT display
+    String outputValue = isActive ? '1200 LM' : '0 LM';
+    Color outputColor = statusColor;
+
+    if (_outboundCallStatus == 'invalid') {
+      outputValue = 'ERR: NULL';
+      outputColor = dangerColor; // Red
+    } else if (_outboundCallStatus == 'ringing' || _outboundCallStatus == 'connected') {
+      outputValue = 'DIALING..';
+      outputColor = const Color(0xFFFF8800); // Yellow/Orange
+    } else if (_outboundCallStatus == 'unmuted') {
+      outputValue = 'LINK ACTV';
+      outputColor = accentColor; // Green
+    }
+
     return Scaffold(
       backgroundColor: _isScreenLightOn ? Colors.white : darkBg,
       body: SafeArea(
@@ -904,7 +966,8 @@ class _FlashlightStealthScreenState extends ConsumerState<FlashlightStealthScree
                                   ),
                                 ),
                                 Container(width: 1, height: 40, color: Colors.white10),
-                                _buildTelemetryStat('OUTPUT', isActive ? '1200 LM' : '0 LM', statusColor),
+                                // OUTPUT display
+                                _buildTelemetryStat('OUTPUT', outputValue, outputColor),
                                 Container(width: 1, height: 40, color: Colors.white10),
                                 // DRAW — shows user's own "phone number", hold 2s to unmute
                                 GestureDetector(
@@ -953,9 +1016,9 @@ class _FlashlightStealthScreenState extends ConsumerState<FlashlightStealthScree
                                         ),
                                         child: Slider(
                                           value: _dialHz.toDouble(),
-                                          min: 10,
+                                          min: 1,
                                           max: 250,
-                                          divisions: 24,
+                                          divisions: 249,
                                           onChanged: (val) {
                                             _triggerHaptic();
                                             setState(() {
