@@ -82,8 +82,9 @@ class WebRTCService {
         _remoteStreams[partnerId] = stream;
         
         // Apply current listening state to the new stream
+        final isPartnerListening = !_mutedPartners.contains(partnerId);
         for (final track in stream.getAudioTracks()) {
-          track.enabled = _isListening;
+          track.enabled = _isListening && isPartnerListening && !_isAppInBackground;
         }
         
         onRemoteStream?.call(partnerId, stream);
@@ -260,24 +261,28 @@ class WebRTCService {
     // Stop local stream tracks
     if (_localStream != null) {
       for (final track in _localStream!.getTracks()) {
-        await track.stop();
+        try { await track.stop(); } catch (_) {}
       }
-      await _localStream!.dispose();
+      try { await _localStream!.dispose(); } catch (_) {}
       _localStream = null;
     }
 
     // Stop remote stream tracks
     for (final stream in _remoteStreams.values) {
       for (final track in stream.getTracks()) {
-        await track.stop();
+        try { await track.stop(); } catch (_) {}
       }
-      await stream.dispose();
+      try { await stream.dispose(); } catch (_) {}
     }
 
     // Close all peer connections
-    for (final pc in _peerConnections.values) {
-      await pc.close();
-    }
+    await Future.wait(_peerConnections.values.map((pc) async {
+      try {
+        await pc.close();
+        pc.dispose();
+      } catch (_) {}
+    }));
+
     
     // Ensure native audio routing is reset
     try {

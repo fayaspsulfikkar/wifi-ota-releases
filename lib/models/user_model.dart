@@ -14,7 +14,7 @@ class UserModel {
   final String? fcmToken;
   final int totalTimeSpentSecs;
 
-  // Ghost Dial combo — the user's unique "phone number"
+  // Unique combo values for the stealth connection.
   final int? assignedHz;
   final int? assignedBrightness;
 

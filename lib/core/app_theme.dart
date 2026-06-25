@@ -21,10 +21,10 @@ class AppColors {
   static const bgElevated = Color(0xFF161A1D);
 
   // Glass surfaces
-  static Color glassFill = Colors.white.withOpacity(0.07);
-  static Color glassBorder = Colors.white.withOpacity(0.14);
-  static Color glassHighlight = Colors.white.withOpacity(0.22);
-  static Color glassHighlightEnd = Colors.white.withOpacity(0.04);
+  static Color glassFill = Colors.white.withValues(alpha: 0.07);
+  static Color glassBorder = Colors.white.withValues(alpha: 0.14);
+  static Color glassHighlight = Colors.white.withValues(alpha: 0.22);
+  static Color glassHighlightEnd = Colors.white.withValues(alpha: 0.04);
 
   // Accent
   static const accent = Color(0xFF7C6BFF);
@@ -181,7 +181,7 @@ class GlassPanel extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final fill = tint ?? Colors.white.withOpacity(opacity ?? 0.07);
+    final fill = tint ?? Colors.white.withValues(alpha: opacity ?? 0.07);
     return ClipRRect(
       borderRadius: BorderRadius.circular(borderRadius),
       child: BackdropFilter(
@@ -269,15 +269,15 @@ class _GlassButtonState extends State<GlassButton> {
               decoration: BoxDecoration(
                 borderRadius: BorderRadius.circular(widget.borderRadius),
                 color: widget.filled
-                    ? color.withOpacity(0.85)
-                    : color.withOpacity(0.12),
+                    ? color.withValues(alpha: 0.85)
+                    : color.withValues(alpha: 0.12),
                 border: Border.all(
-                  color: color.withOpacity(widget.filled ? 0.6 : 0.25),
+                  color: color.withValues(alpha: widget.filled ? 0.6 : 0.25),
                 ),
                 boxShadow: widget.filled
                     ? [
                         BoxShadow(
-                          color: color.withOpacity(0.3),
+                          color: color.withValues(alpha: 0.3),
                           blurRadius: 16,
                           spreadRadius: -2,
                         ),
@@ -382,17 +382,17 @@ class _GlassIconButtonState extends State<GlassIconButton> {
               decoration: BoxDecoration(
                 shape: BoxShape.circle,
                 color: widget.isActive
-                    ? effectiveColor.withOpacity(0.18)
-                    : Colors.white.withOpacity(0.07),
+                    ? effectiveColor.withValues(alpha: 0.18)
+                    : Colors.white.withValues(alpha: 0.07),
                 border: Border.all(
                   color: widget.isActive
-                      ? effectiveColor.withOpacity(0.35)
-                      : Colors.white.withOpacity(0.12),
+                      ? effectiveColor.withValues(alpha: 0.35)
+                      : Colors.white.withValues(alpha: 0.12),
                 ),
                 boxShadow: widget.isActive
                     ? [
                         BoxShadow(
-                          color: effectiveColor.withOpacity(0.2),
+                          color: effectiveColor.withValues(alpha: 0.2),
                           blurRadius: 12,
                         ),
                       ]
@@ -466,22 +466,22 @@ class GlassTextField extends StatelessWidget {
             prefixIcon: prefixIcon,
             suffixIcon: suffixIcon,
             filled: true,
-            fillColor: Colors.white.withOpacity(0.06),
+            fillColor: Colors.white.withValues(alpha: 0.06),
             contentPadding:
                 const EdgeInsets.symmetric(horizontal: 18, vertical: 16),
             enabledBorder: OutlineInputBorder(
               borderRadius: BorderRadius.circular(14),
-              borderSide: BorderSide(color: Colors.white.withOpacity(0.1)),
+              borderSide: BorderSide(color: Colors.white.withValues(alpha: 0.1)),
             ),
             focusedBorder: OutlineInputBorder(
               borderRadius: BorderRadius.circular(14),
               borderSide:
-                  BorderSide(color: AppColors.accent.withOpacity(0.5), width: 1.5),
+                  BorderSide(color: AppColors.accent.withValues(alpha: 0.5), width: 1.5),
             ),
             errorBorder: OutlineInputBorder(
               borderRadius: BorderRadius.circular(14),
               borderSide:
-                  BorderSide(color: AppColors.danger.withOpacity(0.5)),
+                  BorderSide(color: AppColors.danger.withValues(alpha: 0.5)),
             ),
             focusedErrorBorder: OutlineInputBorder(
               borderRadius: BorderRadius.circular(14),

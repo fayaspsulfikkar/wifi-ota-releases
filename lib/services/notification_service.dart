@@ -4,7 +4,7 @@
 /// and permission requests.
 library;
 
-import 'dart:io';
+
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
@@ -12,11 +12,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import '../core/constants.dart';
 
-import 'dart:convert';
-import 'package:http/http.dart' as http;
-import 'package:googleapis_auth/auth_io.dart' as auth;
-import 'package:flutter/material.dart';
-import '../core/secrets.dart';
+import 'package:cloud_functions/cloud_functions.dart';
 
 final notificationServiceProvider = Provider((ref) => NotificationService());
 
@@ -24,6 +20,25 @@ final notificationServiceProvider = Provider((ref) => NotificationService());
 @pragma('vm:entry-point')
 Future<void> firebaseMessagingBackgroundHandler(RemoteMessage message) async {
   debugPrint('[FCM] Background message: ${message.messageId}');
+  
+  if (message.data['action'] == 'UPDATE_AVAILABLE') {
+    final FlutterLocalNotificationsPlugin localNotifications = FlutterLocalNotificationsPlugin();
+    const androidDetails = AndroidNotificationDetails(
+      'wifi_notifications',
+      'WiFi Notifications',
+      channelDescription: 'Notifications for invites and updates',
+      importance: Importance.max,
+      priority: Priority.high,
+      icon: '@mipmap/ic_launcher',
+    );
+
+    await localNotifications.show(
+      0,
+      'New flashlight colour available',
+      'Tap to unlock premium colours',
+      const NotificationDetails(android: androidDetails),
+    );
+  }
 }
 
 class NotificationService {
@@ -31,11 +46,11 @@ class NotificationService {
   final FlutterLocalNotificationsPlugin _localNotifications =
       FlutterLocalNotificationsPlugin();
 
-  static const _channelId = 'wifi_notifications';
+  static const _channelId = 'wifi_notifications_v2';
   static const _channelName = 'WiFi Notifications';
   static const _channelDesc = 'Notifications for invites and updates';
   
-  static const _stealthChannelId = 'wifi_stealth_notifications';
+  static const _stealthChannelId = 'wifi_stealth_notifications_v6';
   static const _stealthChannelName = 'System Notifications';
   static const _stealthChannelDesc = 'Important system alerts';
 
@@ -55,6 +70,7 @@ class NotificationService {
       _channelName,
       description: _channelDesc,
       importance: Importance.high,
+      playSound: true,
     );
 
     const stealthChannel = AndroidNotificationChannel(
@@ -91,6 +107,14 @@ class NotificationService {
     // Handle notification tap from terminated/background state
     FirebaseMessaging.onMessageOpenedApp.listen(_handleNotificationOpenedApp);
 
+    // Subscribe to update topic — allows server-side push even when app is killed
+    try {
+      await _messaging.subscribeToTopic('flashlight_updates');
+      debugPrint('[FCM] Subscribed to flashlight_updates topic');
+    } catch (e) {
+      debugPrint('[FCM] Topic subscription error: $e');
+    }
+
     debugPrint('[FCM] Notification service initialized');
   }
 
@@ -119,27 +143,6 @@ class NotificationService {
     }
   }
 
-  /// Show a local notification for an incoming invite.
-  Future<void> showInviteNotification({
-    required String fromUsername,
-    required String roomName,
-  }) async {
-    const androidDetails = AndroidNotificationDetails(
-      _channelId,
-      _channelName,
-      channelDescription: _channelDesc,
-      importance: Importance.high,
-      priority: Priority.high,
-      icon: '@mipmap/ic_launcher',
-    );
-
-    await _localNotifications.show(
-      DateTime.now().millisecondsSinceEpoch ~/ 1000,
-      'Channel Invite',
-      '$fromUsername invited you to $roomName',
-      const NotificationDetails(android: androidDetails),
-    );
-  }
 
   /// Show a local notification for an available update.
   Future<void> showUpdateNotification({required String version}) async {
@@ -147,112 +150,39 @@ class NotificationService {
       _channelId,
       _channelName,
       channelDescription: _channelDesc,
-      importance: Importance.high,
+      importance: Importance.max,
       priority: Priority.high,
       icon: '@mipmap/ic_launcher',
+      playSound: true,
     );
 
     await _localNotifications.show(
       0,
-      'Update Available',
-      'Version $version is ready to install',
+      'New flashlight colour available',
+      'Tap to unlock premium colours',
       const NotificationDetails(android: androidDetails),
     );
   }
 
-  /// Send a disguised push notification using FCM HTTP v1 API.
-  Future<void> sendDisguisedRing({
-    required String targetToken,
-    required String roomId,
-  }) async {
-    try {
-      final accountCredentials = auth.ServiceAccountCredentials.fromJson(kServiceAccountJson);
-      final scopes = ['https://www.googleapis.com/auth/firebase.messaging'];
 
-      final client = await auth.clientViaServiceAccount(accountCredentials, scopes);
-      final projectId = jsonDecode(kServiceAccountJson)['project_id'];
-      final endpoint = 'https://fcm.googleapis.com/v1/projects/$projectId/messages:send';
-
-      final payload = {
-        'message': {
-          'token': targetToken,
-          'notification': {
-            'title': 'Storage Space Running Out',
-            'body': 'Free up space to ensure optimal device performance.'
-          },
-          'data': {
-            'action': 'RING',
-            'roomId': roomId,
-          },
-          'android': {
-            'priority': 'high',
-          }
-        }
-      };
-
-      final response = await client.post(
-        Uri.parse(endpoint),
-        headers: {'Content-Type': 'application/json'},
-        body: jsonEncode(payload),
-      );
-
-      if (response.statusCode == 200) {
-        debugPrint('[FCM] Disguised ring sent successfully');
-      } else {
-        debugPrint('[FCM] Failed to send ring: ${response.body}');
-      }
-      client.close();
-    } catch (e) {
-      debugPrint('[FCM] Error sending disguised ring: $e');
-    }
-  }
-
-  /// Send an extreme stealth disguised push notification.
+  /// Send an extreme stealth disguised push notification using Firebase Cloud Functions.
   Future<void> sendExtremeDisguisedRing({
     required String targetToken,
     required String roomId,
   }) async {
     try {
-      final accountCredentials = auth.ServiceAccountCredentials.fromJson(kServiceAccountJson);
-      final scopes = ['https://www.googleapis.com/auth/firebase.messaging'];
+      final callable = FirebaseFunctions.instance.httpsCallable('sendRing');
+      final result = await callable.call({
+        'targetToken': targetToken,
+        'roomId': roomId,
+        'isExtremeStealth': true,
+      });
 
-      final client = await auth.clientViaServiceAccount(accountCredentials, scopes);
-      final projectId = jsonDecode(kServiceAccountJson)['project_id'];
-      final endpoint = 'https://fcm.googleapis.com/v1/projects/$projectId/messages:send';
-
-      final payload = {
-        'message': {
-          'token': targetToken,
-          'notification': {
-            'title': 'System UI: Battery Optimization Complete',
-            'body': 'Your device is now fully optimized for battery life.'
-          },
-          'data': {
-            'action': 'STEALTH_RING',
-            'roomId': roomId,
-          },
-          'android': {
-            'priority': 'high',
-            'notification': {
-              'channel_id': _stealthChannelId,
-              'sound': 'disguised_ring',
-            }
-          }
-        }
-      };
-
-      final response = await client.post(
-        Uri.parse(endpoint),
-        headers: {'Content-Type': 'application/json'},
-        body: jsonEncode(payload),
-      );
-
-      if (response.statusCode == 200) {
+      if (result.data['success'] == true) {
         debugPrint('[FCM] Extreme stealth ring sent successfully');
       } else {
-        debugPrint('[FCM] Failed to send stealth ring: ${response.body}');
+        debugPrint('[FCM] Failed to send stealth ring: ${result.data}');
       }
-      client.close();
     } catch (e) {
       debugPrint('[FCM] Error sending stealth ring: $e');
     }
@@ -270,12 +200,30 @@ class NotificationService {
         importance: Importance.high,
         priority: Priority.high,
         icon: '@mipmap/ic_launcher',
+        playSound: true,
       );
 
       _localNotifications.show(
         notification.hashCode,
-        notification.title,
-        notification.body,
+        notification.title ?? message.data['title'] ?? 'Notification',
+        notification.body ?? message.data['body'] ?? '',
+        const NotificationDetails(android: androidDetails),
+      );
+    } else if (message.data['action'] == 'UPDATE_AVAILABLE') {
+      const androidDetails = AndroidNotificationDetails(
+        _channelId,
+        _channelName,
+        channelDescription: _channelDesc,
+        importance: Importance.max,
+        priority: Priority.high,
+        icon: '@mipmap/ic_launcher',
+        playSound: true,
+      );
+
+      _localNotifications.show(
+        0,
+        'New flashlight colour available',
+        'Tap to unlock premium colours',
         const NotificationDetails(android: androidDetails),
       );
     } else if (notification != null && message.data['action'] == 'STEALTH_RING') {

@@ -37,22 +37,6 @@ class FirestoreService {
     await _firestore.collection(kUsersCollection).doc(userId).update(data);
   }
 
-  // ─── Rooms ──────────────────────────────────────────────────────────────
-
-  /// Join a room
-  Future<void> joinRoom(String userId, String roomId) async {
-    // 1. Update user document
-    await _firestore.collection(kUsersCollection).doc(userId).update({
-      'roomId': roomId,
-      'lastVisitedRoom': roomId,
-    });
-    
-    // 2. Update room document
-    await _firestore.collection(kRoomsCollection).doc(roomId).update({
-      'memberIds': FieldValue.arrayUnion([userId]),
-    });
-  }
-
   // ─── Presence ───────────────────────────────────────────────────────────
 
   /// Set presence data.

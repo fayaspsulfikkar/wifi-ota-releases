@@ -337,6 +337,10 @@ class SignalingService {
     
     _lastProcessedOffers.remove(partnerId);
     
+    if (_connectedPartners.isEmpty) {
+      _processedCandidateIds.clear();
+    }
+    
     await _webrtcService.closeConnection(partnerId);
   }
 
@@ -364,5 +368,8 @@ class SignalingService {
     
     _roomId = null;
     _myUserId = null;
+    
+    // Explicitly dispose all WebRTC peer connections and audio tracks to prevent audio leaks
+    await _webrtcService.disposeAll();
   }
 }

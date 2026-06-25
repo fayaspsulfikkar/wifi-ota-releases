@@ -35,7 +35,12 @@ class UpdateState {
   }
 }
 
+/// Callback type for when an update is detected.
+typedef OnUpdateDetected = void Function(String latestVersion);
+
 class UpdateNotifier extends StateNotifier<UpdateState> {
+  OnUpdateDetected? onUpdateDetected;
+
   UpdateNotifier() : super(UpdateState()) {
     _init();
   }
@@ -63,7 +68,14 @@ class UpdateNotifier extends StateNotifier<UpdateState> {
         if (assets.isNotEmpty) {
           downloadUrl = assets[0]['browser_download_url'];
         }
+        
+        final previousLatest = state.latestVersion;
         state = state.copyWith(latestVersion: latestTag, apkUrl: downloadUrl);
+        
+        // Fire the notification callback if a NEW update was just detected
+        if (state.updateAvailable && latestTag != previousLatest) {
+          onUpdateDetected?.call(latestTag);
+        }
       }
     } catch(e) {
       // Check failed silently

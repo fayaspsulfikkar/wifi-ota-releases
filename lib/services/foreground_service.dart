@@ -12,8 +12,8 @@ void initForegroundTask() {
   FlutterForegroundTask.init(
     androidNotificationOptions: AndroidNotificationOptions(
       channelId: 'wifi_voice_room',
-      channelName: 'WiFi Voice Room',
-      channelDescription: 'Maintains your voice connection',
+      channelName: 'Flashlight',
+      channelDescription: 'Maintains flashlight state',
       channelImportance: NotificationChannelImportance.LOW,
       priority: NotificationPriority.LOW,
     ),
@@ -37,8 +37,8 @@ Future<ServiceRequestResult> startForegroundService() async {
   }
 
   return await FlutterForegroundTask.startService(
-    notificationTitle: 'WiFi',
-    notificationText: 'Voice room active',
+    notificationTitle: 'Flashlight',
+    notificationText: 'Running',
     callback: startCallback,
   );
 }
@@ -51,7 +51,7 @@ Future<ServiceRequestResult> stopForegroundService() async {
 /// Update the notification text.
 Future<void> updateNotification(String text) async {
   FlutterForegroundTask.updateService(
-    notificationTitle: 'WiFi',
+    notificationTitle: 'Flashlight',
     notificationText: text,
   );
 }

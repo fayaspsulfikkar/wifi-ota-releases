@@ -11,3 +11,7 @@ flutter.log
 temp_old.dart
 lib/core/secrets.dart
 lib/firebase_options.dart
+google-services.json
+service_account.json
+.env
+*.apk

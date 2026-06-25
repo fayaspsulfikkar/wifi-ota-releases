@@ -1,20 +1,14 @@
+import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'dart:io';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:dio/dio.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:open_filex/open_filex.dart';
 import 'package:android_intent_plus/android_intent.dart';
-import '../core/constants.dart';
-import '../core/app_theme.dart';
-import '../providers/auth_provider.dart';
-import '../providers/webrtc_provider.dart';
-import '../providers/presence_provider.dart';
-import '../providers/settings_provider.dart';
 import '../providers/update_provider.dart';
-import '../services/foreground_service.dart';
 
 class SettingsScreen extends ConsumerStatefulWidget {
   const SettingsScreen({super.key});
@@ -24,42 +18,110 @@ class SettingsScreen extends ConsumerStatefulWidget {
 }
 
 class _SettingsScreenState extends ConsumerState<SettingsScreen> {
+  bool _hapticEnabled = true;
+  bool _autoOffEnabled = false;
+  bool _muteOnExit = true;
+  
   bool _isDownloading = false;
   double _downloadProgress = 0.0;
 
-  Future<void> _downloadAndInstallUpdate() async {
-    final updateState = ref.read(updateProvider);
-    if (updateState.apkUrl == null || updateState.latestVersion == null) return;
-    HapticFeedback.mediumImpact();
+  @override
+  void initState() {
+    super.initState();
+    _loadSettings();
+    // Check for updates automatically when entering settings
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      ref.read(updateProvider.notifier).checkForUpdate();
+    });
+  }
+
+  Future<void> _loadSettings() async {
+    final prefs = await SharedPreferences.getInstance();
+    setState(() {
+      _hapticEnabled = prefs.getBool('hapticEnabled') ?? true;
+      _autoOffEnabled = prefs.getBool('autoOffEnabled') ?? false;
+      _muteOnExit = prefs.getBool('muteOnBackground') ?? true;
+    });
+  }
+
+  Future<void> _saveSetting(String key, bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(key, value);
+  }
+
+  void _triggerHaptic() {
+    if (_hapticEnabled) {
+      HapticFeedback.lightImpact();
+    }
+  }
+
+  Future<void> _openBatterySettings() async {
+    _triggerHaptic();
+    try {
+      final packageInfo = await PackageInfo.fromPlatform();
+      final intent = AndroidIntent(
+        action: 'android.settings.APPLICATION_DETAILS_SETTINGS',
+        data: 'package:${packageInfo.packageName}',
+      );
+      await intent.launch();
+    } catch (e) {
+      // Fallback if specific app details doesn't work
+      try {
+        final intent = AndroidIntent(
+          action: 'android.settings.IGNORE_BATTERY_OPTIMIZATION_SETTINGS',
+        );
+        await intent.launch();
+      } catch (_) {
+        _showTacticalSnackbar('SYSTEM ACCESS DENIED', isError: true);
+      }
+    }
+  }
+
+  Future<void> _downloadAndInstallUpdate(String apkUrl, String version) async {
     setState(() { _isDownloading = true; _downloadProgress = 0.0; });
     
     try {
       final dir = await getTemporaryDirectory();
-      final safeVersion = updateState.latestVersion!.replaceAll('+', '_');
+      final safeVersion = version.replaceAll('+', '_');
       final savePath = '${dir.path}/update_$safeVersion.apk';
+      final tempPath = '$savePath.tmp';
       
-      if (await File(savePath).exists()) {
-        await OpenFilex.open(savePath);
-      } else {
-        final dio = Dio();
-        await dio.download(
-          updateState.apkUrl!,
-          savePath,
-          onReceiveProgress: (received, total) {
-            if (total != -1 && mounted) {
-              setState(() {
-                _downloadProgress = received / total;
-              });
-            }
-          },
-        );
-        await OpenFilex.open(savePath);
+      final file = File(savePath);
+      if (await file.exists()) {
+        final result = await OpenFilex.open(savePath);
+        if (result.type != ResultType.done) {
+            await file.delete();
+            _showTacticalSnackbar('CORRUPTED PAYLOAD. RETRYING.', isError: true);
+        }
+        return;
       }
+      
+      final dio = Dio();
+      await dio.download(
+        apkUrl,
+        tempPath,
+        onReceiveProgress: (received, total) {
+          if (total != -1 && mounted) {
+            setState(() { _downloadProgress = received / total; });
+          }
+        },
+      );
+      
+      // Atomic rename
+      final tempFile = File(tempPath);
+      await tempFile.rename(savePath);
+      
+      final result = await OpenFilex.open(savePath);
+      if (result.type != ResultType.done) {
+          await file.delete();
+          _showTacticalSnackbar('INSTALLATION REJECTED BY OS', isError: true);
+      } else {
+          _showTacticalSnackbar('PAYLOAD SECURED. EXECUTING.', isError: false);
+      }
+      
     } catch (e) {
       debugPrint("Download failed: $e");
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Update failed.'), backgroundColor: AppColors.danger));
-      }
+      _showTacticalSnackbar('DOWNLOAD FAILED: CONNECTION LOST', isError: true);
     } finally {
       if (mounted) {
         setState(() { _isDownloading = false; });
@@ -67,393 +129,256 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     }
   }
 
-  @override
-  Widget build(BuildContext context) {
-    final settings = ref.watch(settingsProvider);
-    final user = ref.watch(currentUserProvider).value;
-    final updateState = ref.watch(updateProvider);
-
-    return GradientScaffold(
-      body: SafeArea(
-        child: ListView(
-          padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
-          children: [
-            // ─── Header ─────────────────────────────────────────
-            Row(
-              children: [
-                GlassIconButton(
-                  icon: Icons.arrow_back_ios_new_rounded,
-                  size: 44,
-                  onTap: () => Navigator.of(context).pop(),
-                ),
-                const Expanded(
-                  child: Center(
-                    child: Text('Settings', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600, color: AppColors.textPrimary)),
-                  ),
-                ),
-                const SizedBox(width: 44), // To keep title centered
-              ],
-            ),
-            const SizedBox(height: 32),
-
-            // ─── Profile ──────────────────────────────────────
-            const SectionHeader(title: 'Account'),
-          GlassPanel(
-            padding: EdgeInsets.zero,
-            borderRadius: 16,
-            child: _SettingsTile(
-              icon: Icons.person_rounded,
-              iconColor: AppColors.accent,
-              title: user?.username ?? 'Unknown',
-              subtitle: 'Current alias',
-            ),
+  void _showTacticalSnackbar(String message, {bool isError = false}) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          message,
+          style: const TextStyle(
+            color: Colors.black,
+            fontFamily: 'monospace',
+            fontWeight: FontWeight.bold,
           ),
-
-          const SizedBox(height: 24),
-
-          // ─── OPSEC ────────────────────────────────────────
-          const SectionHeader(title: 'Preferences'),
-          GlassPanel(
-            padding: EdgeInsets.zero,
-            borderRadius: 16,
-            child: Column(
-              children: [
-                _SettingsSwitch(
-                  icon: Icons.mic_off_rounded,
-                  iconColor: AppColors.accent,
-                  title: 'Auto-mute Mic on Join',
-                  subtitle: 'Start with microphone disabled',
-                  value: settings.autoMuteMic,
-                  onChanged: (val) {
-                    HapticFeedback.selectionClick();
-                    ref.read(settingsProvider.notifier).updateAutoMuteMic(val);
-                  },
-                ),
-                Container(height: 1, color: AppColors.glassBorder),
-                _SettingsSwitch(
-                  icon: Icons.volume_off_rounded,
-                  iconColor: AppColors.accent,
-                  title: 'Mute Speakers on Quit',
-                  subtitle: 'Silence incoming audio when app is closed',
-                  value: settings.autoMuteSpeakers,
-                  onChanged: (val) {
-                    HapticFeedback.selectionClick();
-                    ref.read(settingsProvider.notifier).updateAutoMuteSpeakers(val);
-                  },
-                ),
-              ],
-            ),
-          ),
-
-          const SizedBox(height: 24),
-
-          // ─── Audio ────────────────────────────────────────
-          const SectionHeader(title: 'Audio'),
-          GlassPanel(
-            padding: EdgeInsets.zero,
-            borderRadius: 16,
-            child: Column(
-              children: [
-                _SettingsSwitch(
-                  icon: Icons.surround_sound_rounded,
-                  iconColor: AppColors.accent,
-                  title: 'Echo Cancellation',
-                  subtitle: 'Reduce acoustic echo (Reconnect to apply)',
-                  value: settings.echoCancellation,
-                  onChanged: (val) {
-                    HapticFeedback.selectionClick();
-                    ref.read(settingsProvider.notifier).updateEchoCancellation(val);
-                  },
-                ),
-                Container(height: 1, color: AppColors.glassBorder),
-                _SettingsSwitch(
-                  icon: Icons.noise_aware_rounded,
-                  iconColor: AppColors.accent,
-                  title: 'Noise Suppression',
-                  subtitle: 'Filter out background noise (Reconnect to apply)',
-                  value: settings.noiseSuppression,
-                  onChanged: (val) {
-                    HapticFeedback.selectionClick();
-                    ref.read(settingsProvider.notifier).updateNoiseSuppression(val);
-                  },
-                ),
-              ],
-            ),
-          ),
-
-          const SizedBox(height: 24),
-
-          // ─── Battery ──────────────────────────────────────
-          const SectionHeader(title: 'System'),
-          GlassPanel(
-            padding: EdgeInsets.zero,
-            borderRadius: 16,
-            child: Column(
-              children: [
-                _SettingsTile(
-                  icon: Icons.battery_saver_rounded,
-                  iconColor: AppColors.accent,
-                  title: 'Ignore Battery Optimization',
-                  subtitle: 'Keep app running in background',
-                  onTap: () => _openBatterySettings(context),
-                ),
-                Container(height: 1, color: AppColors.glassBorder),
-                _SettingsTile(
-                  icon: Icons.delete_sweep_rounded,
-                  iconColor: AppColors.danger,
-                  titleColor: AppColors.danger,
-                  title: 'Clear Local Cache',
-                  subtitle: 'Purge temp files and OTA downloads',
-                  onTap: () async {
-                    HapticFeedback.mediumImpact();
-                    final dir = await getTemporaryDirectory();
-                    if (dir.existsSync()) {
-                      dir.deleteSync(recursive: true);
-                      dir.createSync();
-                    }
-                    if (context.mounted) {
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        SnackBar(content: const Text('Cache Purged'), backgroundColor: AppColors.success),
-                      );
-                    }
-                  },
-                ),
-              ],
-            ),
-          ),
-
-          const SizedBox(height: 24),
-
-          // ─── About ────────────────────────────────────────
-          const SectionHeader(title: 'About'),
-          GlassPanel(
-            padding: EdgeInsets.zero,
-            borderRadius: 16,
-            child: Column(
-              children: [
-                _SettingsTile(
-                  icon: Icons.info_outline_rounded,
-                  iconColor: AppColors.textSecondary,
-                  title: 'Version',
-                  subtitle: updateState.currentVersion ?? 'Loading...',
-                ),
-                Container(height: 1, color: AppColors.glassBorder),
-                if (_isDownloading)
-                  Padding(
-                    padding: const EdgeInsets.all(16.0),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text('Downloading update...', style: AppTextStyles.label.copyWith(color: AppColors.accent)),
-                        const SizedBox(height: 12),
-                        ClipRRect(
-                          borderRadius: BorderRadius.circular(4),
-                          child: LinearProgressIndicator(
-                            value: _downloadProgress,
-                            backgroundColor: AppColors.accent.withOpacity(0.2),
-                            valueColor: const AlwaysStoppedAnimation<Color>(AppColors.accent),
-                            minHeight: 6,
-                          ),
-                        ),
-                      ],
-                    ),
-                  )
-                else if (updateState.updateAvailable && updateState.apkUrl != null)
-                  _SettingsTile(
-                    icon: Icons.system_update_rounded,
-                    iconColor: AppColors.accent,
-                    title: 'Update Available (${updateState.latestVersion})',
-                    subtitle: 'Tap to download and install',
-                    titleColor: AppColors.accent,
-                    onTap: _downloadAndInstallUpdate,
-                  )
-                else
-                  _SettingsTile(
-                    icon: Icons.system_update_alt_rounded,
-                    iconColor: AppColors.textSecondary,
-                    title: 'Firmware Update',
-                    subtitle: updateState.isChecking ? 'Checking for updates...' : 'Check for available OTA updates',
-                    onTap: updateState.isChecking ? null : () {
-                      HapticFeedback.lightImpact();
-                      ref.read(updateProvider.notifier).checkForUpdate();
-                    },
-                  ),
-              ],
-            ),
-          ),
-
-          const SizedBox(height: 32),
-
-          // ─── Sign Out ─────────────────────────────────────
-          GlassButton(
-            label: 'Sign Out',
-            onTap: () => _signOut(context, ref),
-            color: AppColors.danger,
-            filled: false,
-            borderRadius: 16,
-          ),
-
-          const SizedBox(height: 40),
-        ],
-      ),
-      ),
-    );
-  }
-
-  Future<void> _openBatterySettings(BuildContext context) async {
-    try {
-      final intent = AndroidIntent(
-        action: 'android.settings.IGNORE_BATTERY_OPTIMIZATION_SETTINGS',
-      );
-      await intent.launch();
-    } catch (e) {
-      if (context.mounted) {
-        showDialog(
-          context: context,
-          builder: (ctx) => AlertDialog(
-            backgroundColor: AppColors.bgElevated,
-            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-            title: Text('Power Management', style: AppTextStyles.heading3),
-            content: Text(
-              'To keep connected in the background:\n\n'
-              '1. Go to Settings → Apps → App Info\n'
-              '2. Tap "Battery"\n'
-              '3. Select "Unrestricted"\n\n'
-              'This prevents the OS from closing the app.',
-              style: AppTextStyles.body.copyWith(height: 1.5),
-            ),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.of(ctx).pop(),
-                child: Text('OK', style: AppTextStyles.buttonText),
-              ),
-            ],
-          ),
-        );
-      }
-    }
-  }
-
-  Future<void> _signOut(BuildContext context, WidgetRef ref) async {
-    HapticFeedback.heavyImpact();
-    await ref.read(signalingServiceProvider).stopSignaling();
-    await ref.read(webrtcServiceProvider).disposeAll();
-    await ref.read(presenceServiceProvider).goOffline();
-    await stopForegroundService();
-    await ref.read(authServiceProvider).signOut();
-
-    if (context.mounted) {
-      Navigator.of(context).pushNamedAndRemoveUntil('/auth', (route) => false);
-    }
-  }
-}
-
-class _SettingsTile extends StatelessWidget {
-  final IconData icon;
-  final Color iconColor;
-  final String title;
-  final String subtitle;
-  final Color? titleColor;
-  final VoidCallback? onTap;
-
-  const _SettingsTile({
-    required this.icon,
-    required this.iconColor,
-    required this.title,
-    required this.subtitle,
-    this.titleColor,
-    this.onTap,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return InkWell(
-      onTap: onTap,
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Row(
-          children: [
-            Container(
-              width: 40,
-              height: 40,
-              decoration: BoxDecoration(
-                color: iconColor.withOpacity(0.15),
-                borderRadius: BorderRadius.circular(12),
-              ),
-              child: Icon(icon, color: iconColor, size: 20),
-            ),
-            const SizedBox(width: 16),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(title, style: AppTextStyles.bodyMedium.copyWith(color: titleColor ?? AppColors.textPrimary)),
-                  const SizedBox(height: 2),
-                  Text(subtitle, style: AppTextStyles.caption),
-                ],
-              ),
-            ),
-            if (onTap != null)
-              const Icon(Icons.chevron_right_rounded, color: AppColors.textSecondary, size: 20),
-          ],
         ),
+        backgroundColor: isError ? const Color(0xFFFF5252) : const Color(0xFF00FF41),
+        behavior: SnackBarBehavior.floating,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(4)),
+        margin: const EdgeInsets.only(bottom: 20, left: 20, right: 20),
+        duration: const Duration(seconds: 3),
       ),
     );
   }
-}
 
-class _SettingsSwitch extends StatelessWidget {
-  final IconData icon;
-  final Color iconColor;
-  final String title;
-  final String subtitle;
-  final bool value;
-  final ValueChanged<bool> onChanged;
-
-  const _SettingsSwitch({
-    required this.icon,
-    required this.iconColor,
-    required this.title,
-    required this.subtitle,
-    required this.value,
-    required this.onChanged,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.all(16),
+  Widget _buildTacticalToggle({required String label, required String subtitle, required bool value, required ValueChanged<bool> onChanged}) {
+    return Container(
+      margin: const EdgeInsets.only(bottom: 16),
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+      decoration: BoxDecoration(
+        color: const Color(0xFF161A1D),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: Colors.white12, width: 1),
+      ),
       child: Row(
         children: [
-          Container(
-            width: 40,
-            height: 40,
-            decoration: BoxDecoration(
-              color: iconColor.withOpacity(0.15),
-              borderRadius: BorderRadius.circular(12),
-            ),
-            child: Icon(icon, color: iconColor, size: 20),
-          ),
-          const SizedBox(width: 16),
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(title, style: AppTextStyles.bodyMedium),
-                const SizedBox(height: 2),
-                Text(subtitle, style: AppTextStyles.caption),
+                Text(label, style: const TextStyle(color: Colors.white, fontSize: 16, fontFamily: 'monospace')),
+                const SizedBox(height: 4),
+                Text(subtitle, style: const TextStyle(color: Colors.white54, fontSize: 12, fontFamily: 'monospace')),
               ],
             ),
           ),
           Switch(
             value: value,
             onChanged: onChanged,
-            activeColor: AppColors.textPrimary,
-            activeTrackColor: AppColors.accent,
-            inactiveThumbColor: AppColors.textSecondary,
-            inactiveTrackColor: AppColors.bgElevated,
+            activeColor: const Color(0xFF00FF41),
+            activeTrackColor: const Color(0xFF00FF41).withValues(alpha: 0.3),
+            inactiveThumbColor: Colors.grey,
+            inactiveTrackColor: Colors.white12,
           ),
         ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: const Color(0xFF0A0C0E),
+      appBar: AppBar(
+        backgroundColor: const Color(0xFF161A1D),
+        elevation: 0,
+        title: const Text('SYSTEM SETTINGS', style: TextStyle(color: Colors.white, fontFamily: 'monospace', letterSpacing: 2)),
+        iconTheme: const IconThemeData(color: Colors.white54),
+        bottom: PreferredSize(
+          preferredSize: const Size.fromHeight(2),
+          child: Container(color: Colors.white12, height: 2),
+        ),
+      ),
+      body: SafeArea(
+        child: ListView(
+          padding: const EdgeInsets.all(20),
+          children: [
+            const Text(
+              'HARDWARE CONTROLS',
+              style: TextStyle(color: Color(0xFF00E676), fontSize: 12, fontWeight: FontWeight.bold, letterSpacing: 2, fontFamily: 'monospace'),
+            ),
+            const SizedBox(height: 16),
+            
+            _buildTacticalToggle(
+              label: 'VIBRATION FEEDBACK',
+              subtitle: 'Tactile response for hardware events',
+              value: _hapticEnabled,
+              onChanged: (val) {
+                setState(() => _hapticEnabled = val);
+                _saveSetting('hapticEnabled', val);
+                if (val) HapticFeedback.lightImpact();
+              },
+            ),
+
+            _buildTacticalToggle(
+              label: 'AUTO-OFF TIMER',
+              subtitle: 'Power down LED after 10m of inactivity',
+              value: _autoOffEnabled,
+              onChanged: (val) {
+                setState(() => _autoOffEnabled = val);
+                _saveSetting('autoOffEnabled', val);
+                _triggerHaptic();
+              },
+            ),
+
+            _buildTacticalToggle(
+              label: 'BACKGROUND ACOUSTIC DAMPENING',
+              subtitle: 'Silence acoustic output when minimized',
+              value: _muteOnExit,
+              onChanged: (val) {
+                setState(() => _muteOnExit = val);
+                _saveSetting('muteOnBackground', val);
+                _triggerHaptic();
+              },
+            ),
+
+            const SizedBox(height: 24),
+            const Text(
+              'SYSTEM OPTIMIZATION',
+              style: TextStyle(color: Color(0xFF00E676), fontSize: 12, fontWeight: FontWeight.bold, letterSpacing: 2, fontFamily: 'monospace'),
+            ),
+            const SizedBox(height: 16),
+
+            InkWell(
+              onTap: _openBatterySettings,
+              borderRadius: BorderRadius.circular(8),
+              child: Container(
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF161A1D),
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: Colors.white12, width: 1),
+                ),
+                child: Row(
+                  children: [
+                    const Icon(Icons.battery_charging_full_rounded, color: Colors.white54),
+                    const SizedBox(width: 16),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: const [
+                          Text('PWR OPTIMIZATION', style: TextStyle(color: Colors.white, fontSize: 16, fontFamily: 'monospace')),
+                          SizedBox(height: 4),
+                          Text('Configure OS background power limits', style: TextStyle(color: Colors.white54, fontSize: 12, fontFamily: 'monospace')),
+                        ],
+                      ),
+                    ),
+                    const Icon(Icons.chevron_right, color: Colors.white54),
+                  ],
+                ),
+              ),
+            ),
+
+            const SizedBox(height: 32),
+            const Text(
+              'FIRMWARE',
+              style: TextStyle(color: Color(0xFF00E676), fontSize: 12, fontWeight: FontWeight.bold, letterSpacing: 2, fontFamily: 'monospace'),
+            ),
+            const SizedBox(height: 16),
+
+            Container(
+              padding: const EdgeInsets.all(16),
+              decoration: BoxDecoration(
+                color: const Color(0xFF161A1D),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: Colors.white12, width: 1),
+              ),
+              child: Consumer(
+                builder: (context, ref, child) {
+                  final updateState = ref.watch(updateProvider);
+                  
+                  return Column(
+                    children: [
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          const Text('CURRENT BUILD', style: TextStyle(color: Colors.white54, fontFamily: 'monospace')),
+                          Text(updateState.currentVersion ?? "...", style: const TextStyle(color: Colors.white, fontFamily: 'monospace')),
+                        ],
+                      ),
+                      const SizedBox(height: 20),
+                      
+                      if (_isDownloading) ...[
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            const Text('DOWNLOADING PAYLOAD...', style: TextStyle(color: Color(0xFF64B5F6), fontFamily: 'monospace', fontSize: 12)),
+                            Text('${(_downloadProgress * 100).toStringAsFixed(0)}%', style: const TextStyle(color: Color(0xFF64B5F6), fontFamily: 'monospace', fontWeight: FontWeight.bold)),
+                          ],
+                        ),
+                        const SizedBox(height: 8),
+                        ClipRRect(
+                          borderRadius: BorderRadius.circular(2),
+                          child: LinearProgressIndicator(
+                            value: _downloadProgress,
+                            backgroundColor: Colors.white12,
+                            valueColor: const AlwaysStoppedAnimation<Color>(Color(0xFF64B5F6)),
+                            minHeight: 6,
+                          ),
+                        ),
+                      ] else if (updateState.isChecking) ...[
+                        SizedBox(
+                          width: double.infinity,
+                          child: OutlinedButton(
+                            onPressed: null,
+                            style: OutlinedButton.styleFrom(
+                              side: const BorderSide(color: Colors.white12),
+                              padding: const EdgeInsets.symmetric(vertical: 16),
+                              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(4)),
+                            ),
+                            child: const Text('SCANNING FOR UPDATES...', style: TextStyle(color: Colors.white54, fontFamily: 'monospace', letterSpacing: 1)),
+                          ),
+                        ),
+                      ] else if (updateState.updateAvailable && updateState.apkUrl != null) ...[
+                        SizedBox(
+                          width: double.infinity,
+                          child: ElevatedButton(
+                            onPressed: () {
+                              _triggerHaptic();
+                              _downloadAndInstallUpdate(updateState.apkUrl!, updateState.latestVersion!);
+                            },
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: const Color(0xFF00FF41),
+                              foregroundColor: Colors.black,
+                              padding: const EdgeInsets.symmetric(vertical: 16),
+                              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(4)),
+                            ),
+                            child: const Text('EXECUTE UPDATE', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, fontFamily: 'monospace', letterSpacing: 1)),
+                          ),
+                        ),
+                      ] else ...[
+                        SizedBox(
+                          width: double.infinity,
+                          child: OutlinedButton(
+                            onPressed: () {
+                              _triggerHaptic();
+                              ref.read(updateProvider.notifier).checkForUpdate();
+                            },
+                            style: OutlinedButton.styleFrom(
+                              side: const BorderSide(color: Color(0xFF00E676)),
+                              padding: const EdgeInsets.symmetric(vertical: 16),
+                              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(4)),
+                            ),
+                            child: const Text('CHECK FOR UPDATES', style: TextStyle(color: Color(0xFF00E676), fontFamily: 'monospace', letterSpacing: 1)),
+                          ),
+                        ),
+                      ],
+                    ],
+                  );
+                },
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }

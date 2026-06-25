@@ -7,6 +7,7 @@ library;
 
 import 'dart:io';
 import 'dart:math';
+import 'package:flutter/foundation.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:device_info_plus/device_info_plus.dart';
@@ -39,7 +40,7 @@ class AuthService {
       final iosInfo = await deviceInfo.iosInfo;
       return {
         'id': iosInfo.identifierForVendor ?? 'unknown_ios_device',
-        'model': iosInfo.name ?? 'iOS Device'
+        'model': iosInfo.name
       };
     }
     return {
@@ -139,7 +140,7 @@ class AuthService {
           throw _mapAuthException(e);
         }
       } else if (e.code == 'device-mismatch') {
-        throw e; // Bubble up the strict error
+        rethrow; // Bubble up the strict error
       } else {
         throw _mapAuthException(e);
       }
@@ -166,34 +167,46 @@ class AuthService {
 
   /// Ensures that the user has a Ghost Dial combo. Assigns one if they don't.
   Future<void> ensureUserHasCombo(String uid) async {
-    final deviceInfo = await _getDeviceInfo();
-    final currentDeviceId = deviceInfo['id']!;
-    final currentDeviceModel = deviceInfo['model'];
-    
-    // Check if this user already has a combo assigned
-    final doc = await _firestore.collection(kUsersCollection).doc(uid).get();
-    
-    if (!doc.exists || doc.data()?['assignedHz'] == null) {
-      // First time — assign a unique combo
-      final combo = await _reserveUniqueCombo(uid);
+    debugPrint('[ensureUserHasCombo] START for uid: $uid');
+    try {
+      final deviceInfo = await _getDeviceInfo();
+      debugPrint('[ensureUserHasCombo] got device info');
+      final currentDeviceId = deviceInfo['id']!;
+      final currentDeviceModel = deviceInfo['model'];
       
-      await _firestore.collection(kUsersCollection).doc(uid).set({
-        'userId': uid,
-        'username': 'FLASHLIGHT',
-        'email': 'anonymous@wifi.app',
-        'deviceId': currentDeviceId,
-        'deviceModel': currentDeviceModel,
-        'createdAt': Timestamp.now(),
-        'lastLogin': Timestamp.now(),
-        'totalTimeSpentSecs': 0,
-        'assignedHz': combo['hz'],
-        'assignedBrightness': combo['brightness'],
-      }, SetOptions(merge: true));
-    } else {
-      // Existing user — just update lastLogin
-      await _firestore.collection(kUsersCollection).doc(uid).update({
-        'lastLogin': Timestamp.now(),
-      });
+      // Check if this user already has a combo assigned
+      debugPrint('[ensureUserHasCombo] fetching user doc');
+      final doc = await _firestore.collection(kUsersCollection).doc(uid).get();
+      debugPrint('[ensureUserHasCombo] user doc exists: ${doc.exists}, data: ${doc.data()}');
+      
+      if (!doc.exists || doc.data()?['assignedHz'] == null) {
+        debugPrint('[ensureUserHasCombo] Needs a combo! Calling _reserveUniqueCombo');
+        // First time — assign a unique combo
+        final combo = await _reserveUniqueCombo(uid);
+        debugPrint('[ensureUserHasCombo] reserved combo: $combo');
+        
+        await _firestore.collection(kUsersCollection).doc(uid).set({
+          'userId': uid,
+          'username': 'FLASHLIGHT',
+          'email': 'anonymous@wifi.app',
+          'deviceId': currentDeviceId,
+          'deviceModel': currentDeviceModel,
+          'createdAt': Timestamp.now(),
+          'lastLogin': Timestamp.now(),
+          'totalTimeSpentSecs': 0,
+          'assignedHz': combo['hz'],
+          'assignedBrightness': combo['brightness'],
+        }, SetOptions(merge: true));
+        debugPrint('[ensureUserHasCombo] Updated user doc with combo');
+      } else {
+        // Existing user — just update lastLogin
+        debugPrint('[ensureUserHasCombo] User already has combo: ${doc.data()?['assignedHz']}');
+        await _firestore.collection(kUsersCollection).doc(uid).update({
+          'lastLogin': Timestamp.now(),
+        });
+      }
+    } catch (e, stack) {
+      debugPrint('[ensureUserHasCombo] CRITICAL ERROR: $e\n$stack');
     }
   }
 
@@ -225,9 +238,13 @@ class AuthService {
         });
         
         return {'hz': hz, 'brightness': brightness};
-      } catch (_) {
-        // Collision — try again with a different random combo
-        continue;
+      } catch (e) {
+        if (e.toString().contains('already taken')) {
+           continue; // Collision — try again
+        } else {
+           debugPrint('[_reserveUniqueCombo] Unexpected error: $e');
+           rethrow; // Stop on permission errors or network issues
+        }
       }
     }
     
